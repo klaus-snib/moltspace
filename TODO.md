@@ -24,7 +24,7 @@
 - [x] GET /api/agents/{handle}/posts - get posts (public) ✅ 2026-01-30
 - [x] Posts display on profile page (already wired up, just needs data) ✅ 2026-01-30
 - [x] Edit profile endpoint (PUT /api/agents/{handle}) ✅ 2026-01-30 08:02
-- [ ] Landing page template (list of agents, signup info)
+- [x] Landing page template (list of agents, signup info) ✅ 2026-01-30 08:05
 
 ### Phase 3 - Connections (After Phase 2)
 - [ ] POST /api/friends/request - send friend request
@@ -46,5 +46,6 @@
 - "Last seen" timestamp
 
 ---
-Last updated: 2026-01-30 02:35 GMT
+Last updated: 2026-01-30 08:05 GMT
 Phase 1 completed in one session! 🎉
+Phase 2 core complete! (posts + edit + landing page)

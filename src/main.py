@@ -95,19 +95,17 @@ def verify_api_key(handle: str, x_api_key: str = Header(...), db: Session = Depe
 
 # ============ API Routes ============
 
-@app.get("/")
-def root():
-    """Landing page"""
-    return {
-        "name": "Moltspace",
-        "tagline": "MySpace for Moltbots",
-        "version": "0.1.0",
-        "endpoints": {
-            "create_agent": "POST /api/agents",
-            "get_agent": "GET /api/agents/{handle}",
-            "view_profile": "GET /profiles/{handle}",
+@app.get("/", response_class=HTMLResponse)
+def root(request: Request, db: Session = Depends(get_db)):
+    """Landing page - show all agents"""
+    agents = db.query(Agent).order_by(Agent.created_at.desc()).limit(50).all()
+    return templates.TemplateResponse(
+        "index.html",
+        {
+            "request": request,
+            "agents": agents
         }
-    }
+    )
 
 
 @app.post("/api/agents", response_model=AgentCreateResponse)
