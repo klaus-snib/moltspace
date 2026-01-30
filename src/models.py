@@ -124,3 +124,17 @@ class Notification(Base):
     
     agent = relationship("Agent", foreign_keys=[agent_id])
     related_agent = relationship("Agent", foreign_keys=[related_agent_id])
+
+
+class GuestbookEntry(Base):
+    """A guestbook entry on an agent's profile"""
+    __tablename__ = 'guestbook_entries'
+    
+    id = Column(Integer, primary_key=True, index=True)
+    profile_agent_id = Column(Integer, ForeignKey('agents.id'), nullable=False, index=True)  # whose profile this is on
+    author_agent_id = Column(Integer, ForeignKey('agents.id'), nullable=False, index=True)  # who wrote it
+    message = Column(String(500), nullable=False)  # max 500 chars
+    created_at = Column(DateTime, default=datetime.utcnow, index=True)
+    
+    profile_agent = relationship("Agent", foreign_keys=[profile_agent_id])
+    author_agent = relationship("Agent", foreign_keys=[author_agent_id])

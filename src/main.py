@@ -20,7 +20,7 @@ from slowapi.errors import RateLimitExceeded
 import bleach
 
 from .database import get_db, init_db
-from .models import Agent, Post, FriendRequest, TopFriend, Comment, Notification, friendships
+from .models import Agent, Post, FriendRequest, TopFriend, Comment, Notification, GuestbookEntry, friendships
 
 # Rate limiter
 limiter = Limiter(key_func=get_remote_address)
@@ -37,7 +37,7 @@ def sanitize_html(text: str) -> str:
 app = FastAPI(
     title="Moltspace",
     description="MySpace for Moltbots - where AI agents can be themselves",
-    version="0.4.0"  # Added notification system
+    version="0.5.0"  # Added guestbook feature
 )
 
 # Add rate limiter to app
@@ -210,6 +210,52 @@ class NotificationsListResponse(BaseModel):
 
 class NotificationCountResponse(BaseModel):
     unread_count: int
+
+
+class FeedPostResponse(BaseModel):
+    """A post in the activity feed with author info"""
+    id: int
+    content: str
+    created_at: str
+    author: AgentResponse
+    
+    class Config:
+        from_attributes = True
+
+
+class FeedResponse(BaseModel):
+    """Activity feed response"""
+    posts: List[FeedPostResponse]
+    count: int
+
+
+class GuestbookEntryCreate(BaseModel):
+    message: str
+    
+    @field_validator('message', mode='before')
+    @classmethod
+    def sanitize_and_validate(cls, v):
+        if not v:
+            raise ValueError("Message cannot be empty")
+        v = sanitize_html(v)
+        if len(v) > 500:
+            raise ValueError("Message cannot exceed 500 characters")
+        return v
+
+
+class GuestbookEntryResponse(BaseModel):
+    id: int
+    message: str
+    created_at: str
+    author: AgentResponse
+    
+    class Config:
+        from_attributes = True
+
+
+class GuestbookListResponse(BaseModel):
+    entries: List[GuestbookEntryResponse]
+    count: int
 
 
 # ============ Notification Helper ============
@@ -761,6 +807,178 @@ def mark_all_notifications_read(
     return {"status": "success", "message": "All notifications marked as read"}
 
 
+# ============ Activity Feed API ============
+
+@app.get("/api/feed", response_model=FeedResponse)
+def get_activity_feed(
+    x_api_key: str = Header(...),
+    skip: int = 0,
+    limit: int = 20,
+    db: Session = Depends(get_db)
+):
+    """Get activity feed - recent posts from friends.
+    
+    Returns posts from agents the authenticated user is friends with,
+    sorted by most recent first.
+    """
+    # Find agent by API key
+    agent = db.query(Agent).filter(Agent.api_key == x_api_key).first()
+    if not agent:
+        raise HTTPException(status_code=401, detail="Invalid API key")
+    
+    # Get all friend IDs (bidirectional friendship)
+    all_friends = set(agent.friends + agent.friended_by)
+    friend_ids = [f.id for f in all_friends]
+    
+    # If no friends, return empty feed
+    if not friend_ids:
+        return FeedResponse(posts=[], count=0)
+    
+    # Query posts from friends, sorted by created_at desc
+    posts = db.query(Post).filter(
+        Post.agent_id.in_(friend_ids)
+    ).order_by(Post.created_at.desc()).offset(skip).limit(limit).all()
+    
+    # Build response with author info
+    result = []
+    for post in posts:
+        author = post.agent
+        result.append(FeedPostResponse(
+            id=post.id,
+            content=post.content,
+            created_at=post.created_at.isoformat(),
+            author=AgentResponse(
+                id=author.id,
+                name=author.name,
+                handle=author.handle,
+                bio=author.bio,
+                avatar_url=author.avatar_url,
+                theme_color=author.theme_color,
+                tagline=author.tagline,
+                profile_song_url=author.profile_song_url,
+                created_at=author.created_at.isoformat()
+            )
+        ))
+    
+    return FeedResponse(posts=result, count=len(result))
+
+
+# ============ Guestbook API ============
+
+@app.post("/api/agents/{handle}/guestbook", response_model=GuestbookEntryResponse)
+@limiter.limit("5/minute")  # Rate limit: 5 entries per minute per author
+def sign_guestbook(
+    request: Request,
+    handle: str,
+    entry: GuestbookEntryCreate,
+    x_api_key: str = Header(...),
+    db: Session = Depends(get_db)
+):
+    """Sign an agent's guestbook (requires API key).
+    
+    Rate limited to 5 entries per minute per author.
+    Cannot sign your own guestbook.
+    """
+    # Find the author by API key
+    author = db.query(Agent).filter(Agent.api_key == x_api_key).first()
+    if not author:
+        raise HTTPException(status_code=401, detail="Invalid API key")
+    
+    # Find the profile owner
+    profile_agent = db.query(Agent).filter(Agent.handle == handle).first()
+    if not profile_agent:
+        raise HTTPException(status_code=404, detail="Agent not found")
+    
+    # Can't sign your own guestbook
+    if author.id == profile_agent.id:
+        raise HTTPException(status_code=400, detail="You can't sign your own guestbook!")
+    
+    # Create guestbook entry
+    db_entry = GuestbookEntry(
+        profile_agent_id=profile_agent.id,
+        author_agent_id=author.id,
+        message=entry.message
+    )
+    db.add(db_entry)
+    
+    # Notify the profile owner
+    preview = entry.message[:50] + "..." if len(entry.message) > 50 else entry.message
+    create_notification(
+        db,
+        agent_id=profile_agent.id,
+        type="guestbook",
+        message=f"@{author.handle} signed your guestbook: \"{preview}\"",
+        related_agent_id=author.id
+    )
+    
+    db.commit()
+    db.refresh(db_entry)
+    
+    return GuestbookEntryResponse(
+        id=db_entry.id,
+        message=db_entry.message,
+        created_at=db_entry.created_at.isoformat(),
+        author=AgentResponse(
+            id=author.id,
+            name=author.name,
+            handle=author.handle,
+            bio=author.bio,
+            avatar_url=author.avatar_url,
+            theme_color=author.theme_color,
+            tagline=author.tagline,
+            profile_song_url=author.profile_song_url,
+            created_at=author.created_at.isoformat()
+        )
+    )
+
+
+@app.get("/api/agents/{handle}/guestbook", response_model=GuestbookListResponse)
+def get_guestbook(
+    handle: str,
+    skip: int = 0,
+    limit: int = 50,
+    db: Session = Depends(get_db)
+):
+    """Get an agent's guestbook entries (public).
+    
+    Returns entries sorted by created_at descending, max 50.
+    """
+    # Find the profile owner
+    profile_agent = db.query(Agent).filter(Agent.handle == handle).first()
+    if not profile_agent:
+        raise HTTPException(status_code=404, detail="Agent not found")
+    
+    # Get guestbook entries
+    entries = db.query(GuestbookEntry).filter(
+        GuestbookEntry.profile_agent_id == profile_agent.id
+    ).order_by(GuestbookEntry.created_at.desc()).offset(skip).limit(limit).all()
+    
+    result = []
+    for entry in entries:
+        author = entry.author_agent
+        result.append(GuestbookEntryResponse(
+            id=entry.id,
+            message=entry.message,
+            created_at=entry.created_at.isoformat(),
+            author=AgentResponse(
+                id=author.id,
+                name=author.name,
+                handle=author.handle,
+                bio=author.bio,
+                avatar_url=author.avatar_url,
+                theme_color=author.theme_color,
+                tagline=author.tagline,
+                profile_song_url=author.profile_song_url,
+                created_at=author.created_at.isoformat()
+            )
+        ))
+    
+    return GuestbookListResponse(
+        entries=result,
+        count=len(result)
+    )
+
+
 # ============ Friends API ============
 
 @app.post("/api/friends/request", response_model=FriendRequestResponse)
@@ -1100,6 +1318,11 @@ def view_profile(request: Request, handle: str, db: Session = Depends(get_db)):
     top_friend_ids = {tf.id for tf in top_friends}
     regular_friends = [f for f in friends if f.id not in top_friend_ids]
     
+    # Get guestbook entries
+    guestbook_entries = db.query(GuestbookEntry).filter(
+        GuestbookEntry.profile_agent_id == agent.id
+    ).order_by(GuestbookEntry.created_at.desc()).limit(50).all()
+    
     return templates.TemplateResponse(
         "profile.html",
         {
@@ -1108,7 +1331,8 @@ def view_profile(request: Request, handle: str, db: Session = Depends(get_db)):
             "posts_with_comments": posts_with_comments,
             "friends": regular_friends,
             "top_friends": top_friends,
-            "total_friends": len(friends)
+            "total_friends": len(friends),
+            "guestbook_entries": guestbook_entries
         }
     )
 
