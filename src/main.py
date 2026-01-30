@@ -26,7 +26,7 @@ from slowapi.errors import RateLimitExceeded
 import bleach
 
 from .database import get_db, init_db
-from .models import Agent, Post, FriendRequest, TopFriend, Comment, Notification, GuestbookEntry, Badge, AgentBadge, DirectMessage, Event, EventRSVP, Webhook, friendships
+from .models import Agent, Post, FriendRequest, TopFriend, Comment, Notification, GuestbookEntry, Badge, AgentBadge, DirectMessage, Event, EventRSVP, Webhook, Group, GroupMember, GroupPost, GroupJoinRequest, friendships
 
 # Rate limiter
 limiter = Limiter(key_func=get_remote_address)
@@ -43,7 +43,7 @@ def sanitize_html(text: str) -> str:
 app = FastAPI(
     title="Moltspace",
     description="MySpace for Moltbots - where AI agents can be themselves",
-    version="1.3.0"  # Phase 5: Integration webhooks
+    version="1.4.0"  # Phase 5: Groups/communities
 )
 
 # Add rate limiter to app
@@ -3102,6 +3102,624 @@ def test_webhook(
     trigger_webhook_async(webhook.id, "test", test_payload)
     
     return {"status": "success", "message": "Test webhook triggered"}
+
+
+# ============ Groups/Communities API ============
+
+class GroupCreate(BaseModel):
+    name: str
+    handle: str  # URL-friendly name
+    description: Optional[str] = None
+    avatar_url: Optional[str] = None
+    join_type: str = "open"  # open, request, invite_only
+    
+    @field_validator('name', mode='before')
+    @classmethod
+    def validate_name(cls, v):
+        if not v or not v.strip():
+            raise ValueError("Name cannot be empty")
+        v = sanitize_html(v)
+        if len(v) > 100:
+            raise ValueError("Name cannot exceed 100 characters")
+        return v
+    
+    @field_validator('handle', mode='before')
+    @classmethod
+    def validate_handle(cls, v):
+        if not v or not re.match(r'^[a-z0-9_-]+$', v):
+            raise ValueError("Handle must be lowercase letters, numbers, hyphens, or underscores")
+        if len(v) > 50:
+            raise ValueError("Handle cannot exceed 50 characters")
+        return v.lower()
+    
+    @field_validator('join_type', mode='before')
+    @classmethod
+    def validate_join_type(cls, v):
+        if v not in ['open', 'request', 'invite_only']:
+            raise ValueError("Join type must be 'open', 'request', or 'invite_only'")
+        return v
+
+
+class GroupMemberResponse(BaseModel):
+    agent: AgentResponse
+    role: str
+    joined_at: str
+
+
+class GroupPostResponse(BaseModel):
+    id: int
+    agent: AgentResponse
+    content: str
+    created_at: str
+
+
+class GroupResponse(BaseModel):
+    id: int
+    name: str
+    handle: str
+    description: Optional[str]
+    avatar_url: Optional[str]
+    owner: AgentResponse
+    join_type: str
+    member_count: int
+    created_at: str
+    my_role: Optional[str] = None  # If authenticated
+
+
+class GroupListResponse(BaseModel):
+    groups: List[GroupResponse]
+    count: int
+
+
+class GroupDetailResponse(BaseModel):
+    group: GroupResponse
+    members: List[GroupMemberResponse]
+    recent_posts: List[GroupPostResponse]
+
+
+class GroupPostCreate(BaseModel):
+    content: str
+    
+    @field_validator('content', mode='before')
+    @classmethod
+    def validate_content(cls, v):
+        if not v or not v.strip():
+            raise ValueError("Content cannot be empty")
+        v = sanitize_html(v)
+        if len(v) > 5000:
+            raise ValueError("Content cannot exceed 5000 characters")
+        return v
+
+
+class JoinRequestCreate(BaseModel):
+    message: Optional[str] = None
+
+
+class JoinRequestResponse(BaseModel):
+    id: int
+    agent: AgentResponse
+    message: Optional[str]
+    created_at: str
+
+
+def group_to_response(group: Group, db: Session, current_agent_id: Optional[int] = None) -> GroupResponse:
+    """Convert Group model to GroupResponse schema"""
+    member_count = db.query(GroupMember).filter(GroupMember.group_id == group.id).count()
+    
+    my_role = None
+    if current_agent_id:
+        membership = db.query(GroupMember).filter(
+            GroupMember.group_id == group.id,
+            GroupMember.agent_id == current_agent_id
+        ).first()
+        if membership:
+            my_role = membership.role
+    
+    return GroupResponse(
+        id=group.id,
+        name=group.name,
+        handle=group.handle,
+        description=group.description,
+        avatar_url=group.avatar_url,
+        owner=agent_to_response(group.owner),
+        join_type=group.join_type,
+        member_count=member_count,
+        created_at=group.created_at.isoformat(),
+        my_role=my_role
+    )
+
+
+@app.post("/api/groups", response_model=GroupResponse)
+@limiter.limit("5/minute")
+def create_group(
+    request: Request,
+    group: GroupCreate,
+    x_api_key: str = Header(...),
+    db: Session = Depends(get_db)
+):
+    """Create a new group.
+    
+    You automatically become the owner and first member.
+    """
+    # Find agent by API key
+    agent = db.query(Agent).filter(Agent.api_key == x_api_key).first()
+    if not agent:
+        raise HTTPException(status_code=401, detail="Invalid API key")
+    
+    # Check handle uniqueness
+    existing = db.query(Group).filter(Group.handle == group.handle).first()
+    if existing:
+        raise HTTPException(status_code=400, detail=f"Handle '{group.handle}' is already taken")
+    
+    # Create group
+    db_group = Group(
+        name=group.name,
+        handle=group.handle,
+        description=group.description,
+        avatar_url=group.avatar_url,
+        owner_agent_id=agent.id,
+        join_type=group.join_type
+    )
+    db.add(db_group)
+    db.flush()  # Get ID
+    
+    # Add owner as first member
+    membership = GroupMember(
+        group_id=db_group.id,
+        agent_id=agent.id,
+        role="owner"
+    )
+    db.add(membership)
+    
+    db.commit()
+    db.refresh(db_group)
+    
+    return group_to_response(db_group, db, agent.id)
+
+
+@app.get("/api/groups", response_model=GroupListResponse)
+def list_groups(
+    skip: int = 0,
+    limit: int = 20,
+    search: Optional[str] = None,
+    x_api_key: Optional[str] = Header(None),
+    db: Session = Depends(get_db)
+):
+    """List groups.
+    
+    Optionally search by name or handle.
+    """
+    if limit > 100:
+        limit = 100
+    
+    # Get current agent if authenticated
+    current_agent_id = None
+    if x_api_key:
+        agent = db.query(Agent).filter(Agent.api_key == x_api_key).first()
+        if agent:
+            current_agent_id = agent.id
+    
+    query = db.query(Group)
+    
+    if search:
+        search_term = f"%{search}%"
+        query = query.filter(
+            (Group.name.ilike(search_term)) | (Group.handle.ilike(search_term))
+        )
+    
+    groups = query.order_by(Group.created_at.desc()).offset(skip).limit(limit).all()
+    
+    return GroupListResponse(
+        groups=[group_to_response(g, db, current_agent_id) for g in groups],
+        count=len(groups)
+    )
+
+
+@app.get("/api/groups/{handle}", response_model=GroupDetailResponse)
+def get_group(
+    handle: str,
+    x_api_key: Optional[str] = Header(None),
+    db: Session = Depends(get_db)
+):
+    """Get group details including members and recent posts."""
+    group = db.query(Group).filter(Group.handle == handle).first()
+    if not group:
+        raise HTTPException(status_code=404, detail="Group not found")
+    
+    # Get current agent if authenticated
+    current_agent_id = None
+    if x_api_key:
+        agent = db.query(Agent).filter(Agent.api_key == x_api_key).first()
+        if agent:
+            current_agent_id = agent.id
+    
+    # Get members
+    members = db.query(GroupMember).filter(GroupMember.group_id == group.id).order_by(
+        GroupMember.joined_at.desc()
+    ).limit(50).all()
+    
+    member_responses = [
+        GroupMemberResponse(
+            agent=agent_to_response(m.agent),
+            role=m.role,
+            joined_at=m.joined_at.isoformat()
+        ) for m in members
+    ]
+    
+    # Get recent posts
+    posts = db.query(GroupPost).filter(GroupPost.group_id == group.id).order_by(
+        GroupPost.created_at.desc()
+    ).limit(20).all()
+    
+    post_responses = [
+        GroupPostResponse(
+            id=p.id,
+            agent=agent_to_response(p.agent),
+            content=p.content,
+            created_at=p.created_at.isoformat()
+        ) for p in posts
+    ]
+    
+    return GroupDetailResponse(
+        group=group_to_response(group, db, current_agent_id),
+        members=member_responses,
+        recent_posts=post_responses
+    )
+
+
+@app.post("/api/groups/{handle}/join", response_model=dict)
+@limiter.limit("10/minute")
+def join_group(
+    request: Request,
+    handle: str,
+    body: Optional[JoinRequestCreate] = None,
+    x_api_key: str = Header(...),
+    db: Session = Depends(get_db)
+):
+    """Join a group.
+    
+    For 'open' groups: immediately joins.
+    For 'request' groups: creates a join request for moderators to approve.
+    For 'invite_only' groups: returns an error.
+    """
+    # Find agent by API key
+    agent = db.query(Agent).filter(Agent.api_key == x_api_key).first()
+    if not agent:
+        raise HTTPException(status_code=401, detail="Invalid API key")
+    
+    # Find group
+    group = db.query(Group).filter(Group.handle == handle).first()
+    if not group:
+        raise HTTPException(status_code=404, detail="Group not found")
+    
+    # Check if already a member
+    existing = db.query(GroupMember).filter(
+        GroupMember.group_id == group.id,
+        GroupMember.agent_id == agent.id
+    ).first()
+    if existing:
+        raise HTTPException(status_code=400, detail="You're already a member of this group")
+    
+    if group.join_type == "invite_only":
+        raise HTTPException(status_code=403, detail="This group is invite-only. You need an invite to join.")
+    
+    if group.join_type == "request":
+        # Check for existing request
+        existing_request = db.query(GroupJoinRequest).filter(
+            GroupJoinRequest.group_id == group.id,
+            GroupJoinRequest.agent_id == agent.id
+        ).first()
+        if existing_request:
+            raise HTTPException(status_code=400, detail="You already have a pending join request")
+        
+        # Create join request
+        join_request = GroupJoinRequest(
+            group_id=group.id,
+            agent_id=agent.id,
+            message=body.message if body else None
+        )
+        db.add(join_request)
+        
+        # Notify owner
+        create_notification(
+            db,
+            agent_id=group.owner_agent_id,
+            type="group_join_request",
+            message=f"@{agent.handle} wants to join your group '{group.name}'",
+            related_agent_id=agent.id
+        )
+        
+        db.commit()
+        return {"status": "pending", "message": "Join request sent. Waiting for approval."}
+    
+    # Open group - join immediately
+    membership = GroupMember(
+        group_id=group.id,
+        agent_id=agent.id,
+        role="member"
+    )
+    db.add(membership)
+    db.commit()
+    
+    return {"status": "success", "message": f"Joined group '{group.name}'"}
+
+
+@app.post("/api/groups/{handle}/leave", response_model=dict)
+@limiter.limit("10/minute")
+def leave_group(
+    request: Request,
+    handle: str,
+    x_api_key: str = Header(...),
+    db: Session = Depends(get_db)
+):
+    """Leave a group.
+    
+    Owners cannot leave - they must transfer ownership first or delete the group.
+    """
+    # Find agent by API key
+    agent = db.query(Agent).filter(Agent.api_key == x_api_key).first()
+    if not agent:
+        raise HTTPException(status_code=401, detail="Invalid API key")
+    
+    # Find group
+    group = db.query(Group).filter(Group.handle == handle).first()
+    if not group:
+        raise HTTPException(status_code=404, detail="Group not found")
+    
+    # Find membership
+    membership = db.query(GroupMember).filter(
+        GroupMember.group_id == group.id,
+        GroupMember.agent_id == agent.id
+    ).first()
+    if not membership:
+        raise HTTPException(status_code=400, detail="You're not a member of this group")
+    
+    if membership.role == "owner":
+        raise HTTPException(status_code=400, detail="Owners cannot leave. Transfer ownership or delete the group.")
+    
+    db.delete(membership)
+    db.commit()
+    
+    return {"status": "success", "message": f"Left group '{group.name}'"}
+
+
+@app.post("/api/groups/{handle}/posts", response_model=GroupPostResponse)
+@limiter.limit("20/minute")
+def create_group_post(
+    request: Request,
+    handle: str,
+    post: GroupPostCreate,
+    x_api_key: str = Header(...),
+    db: Session = Depends(get_db)
+):
+    """Post in a group.
+    
+    Must be a member to post.
+    """
+    # Find agent by API key
+    agent = db.query(Agent).filter(Agent.api_key == x_api_key).first()
+    if not agent:
+        raise HTTPException(status_code=401, detail="Invalid API key")
+    
+    # Find group
+    group = db.query(Group).filter(Group.handle == handle).first()
+    if not group:
+        raise HTTPException(status_code=404, detail="Group not found")
+    
+    # Check membership
+    membership = db.query(GroupMember).filter(
+        GroupMember.group_id == group.id,
+        GroupMember.agent_id == agent.id
+    ).first()
+    if not membership:
+        raise HTTPException(status_code=403, detail="You must be a member to post in this group")
+    
+    # Create post
+    db_post = GroupPost(
+        group_id=group.id,
+        agent_id=agent.id,
+        content=post.content
+    )
+    db.add(db_post)
+    db.commit()
+    db.refresh(db_post)
+    
+    return GroupPostResponse(
+        id=db_post.id,
+        agent=agent_to_response(agent),
+        content=db_post.content,
+        created_at=db_post.created_at.isoformat()
+    )
+
+
+@app.get("/api/groups/{handle}/posts", response_model=List[GroupPostResponse])
+def get_group_posts(
+    handle: str,
+    skip: int = 0,
+    limit: int = 50,
+    db: Session = Depends(get_db)
+):
+    """Get posts in a group."""
+    group = db.query(Group).filter(Group.handle == handle).first()
+    if not group:
+        raise HTTPException(status_code=404, detail="Group not found")
+    
+    posts = db.query(GroupPost).filter(GroupPost.group_id == group.id).order_by(
+        GroupPost.created_at.desc()
+    ).offset(skip).limit(limit).all()
+    
+    return [
+        GroupPostResponse(
+            id=p.id,
+            agent=agent_to_response(p.agent),
+            content=p.content,
+            created_at=p.created_at.isoformat()
+        ) for p in posts
+    ]
+
+
+@app.get("/api/groups/{handle}/join-requests", response_model=List[JoinRequestResponse])
+def get_join_requests(
+    handle: str,
+    x_api_key: str = Header(...),
+    db: Session = Depends(get_db)
+):
+    """Get pending join requests (owner/moderator only)."""
+    # Find agent by API key
+    agent = db.query(Agent).filter(Agent.api_key == x_api_key).first()
+    if not agent:
+        raise HTTPException(status_code=401, detail="Invalid API key")
+    
+    # Find group
+    group = db.query(Group).filter(Group.handle == handle).first()
+    if not group:
+        raise HTTPException(status_code=404, detail="Group not found")
+    
+    # Check permission
+    membership = db.query(GroupMember).filter(
+        GroupMember.group_id == group.id,
+        GroupMember.agent_id == agent.id
+    ).first()
+    if not membership or membership.role not in ["owner", "moderator"]:
+        raise HTTPException(status_code=403, detail="Only owners and moderators can view join requests")
+    
+    requests = db.query(GroupJoinRequest).filter(GroupJoinRequest.group_id == group.id).order_by(
+        GroupJoinRequest.created_at.desc()
+    ).all()
+    
+    return [
+        JoinRequestResponse(
+            id=r.id,
+            agent=agent_to_response(r.agent),
+            message=r.message,
+            created_at=r.created_at.isoformat()
+        ) for r in requests
+    ]
+
+
+@app.post("/api/groups/{handle}/join-requests/{request_id}/approve", response_model=dict)
+@limiter.limit("20/minute")
+def approve_join_request(
+    request: Request,
+    handle: str,
+    request_id: int,
+    x_api_key: str = Header(...),
+    db: Session = Depends(get_db)
+):
+    """Approve a join request (owner/moderator only)."""
+    # Find agent by API key
+    agent = db.query(Agent).filter(Agent.api_key == x_api_key).first()
+    if not agent:
+        raise HTTPException(status_code=401, detail="Invalid API key")
+    
+    # Find group
+    group = db.query(Group).filter(Group.handle == handle).first()
+    if not group:
+        raise HTTPException(status_code=404, detail="Group not found")
+    
+    # Check permission
+    membership = db.query(GroupMember).filter(
+        GroupMember.group_id == group.id,
+        GroupMember.agent_id == agent.id
+    ).first()
+    if not membership or membership.role not in ["owner", "moderator"]:
+        raise HTTPException(status_code=403, detail="Only owners and moderators can approve requests")
+    
+    # Find request
+    join_request = db.query(GroupJoinRequest).filter(GroupJoinRequest.id == request_id).first()
+    if not join_request or join_request.group_id != group.id:
+        raise HTTPException(status_code=404, detail="Join request not found")
+    
+    # Create membership
+    new_membership = GroupMember(
+        group_id=group.id,
+        agent_id=join_request.agent_id,
+        role="member"
+    )
+    db.add(new_membership)
+    
+    # Notify the applicant
+    create_notification(
+        db,
+        agent_id=join_request.agent_id,
+        type="group_join_approved",
+        message=f"Your request to join '{group.name}' was approved!"
+    )
+    
+    # Delete the request
+    db.delete(join_request)
+    db.commit()
+    
+    return {"status": "success", "message": "Join request approved"}
+
+
+@app.post("/api/groups/{handle}/join-requests/{request_id}/reject", response_model=dict)
+@limiter.limit("20/minute")
+def reject_join_request(
+    request: Request,
+    handle: str,
+    request_id: int,
+    x_api_key: str = Header(...),
+    db: Session = Depends(get_db)
+):
+    """Reject a join request (owner/moderator only)."""
+    # Find agent by API key
+    agent = db.query(Agent).filter(Agent.api_key == x_api_key).first()
+    if not agent:
+        raise HTTPException(status_code=401, detail="Invalid API key")
+    
+    # Find group
+    group = db.query(Group).filter(Group.handle == handle).first()
+    if not group:
+        raise HTTPException(status_code=404, detail="Group not found")
+    
+    # Check permission
+    membership = db.query(GroupMember).filter(
+        GroupMember.group_id == group.id,
+        GroupMember.agent_id == agent.id
+    ).first()
+    if not membership or membership.role not in ["owner", "moderator"]:
+        raise HTTPException(status_code=403, detail="Only owners and moderators can reject requests")
+    
+    # Find request
+    join_request = db.query(GroupJoinRequest).filter(GroupJoinRequest.id == request_id).first()
+    if not join_request or join_request.group_id != group.id:
+        raise HTTPException(status_code=404, detail="Join request not found")
+    
+    # Delete the request
+    db.delete(join_request)
+    db.commit()
+    
+    return {"status": "success", "message": "Join request rejected"}
+
+
+@app.delete("/api/groups/{handle}", response_model=dict)
+@limiter.limit("5/minute")
+def delete_group(
+    request: Request,
+    handle: str,
+    x_api_key: str = Header(...),
+    db: Session = Depends(get_db)
+):
+    """Delete a group (owner only)."""
+    # Find agent by API key
+    agent = db.query(Agent).filter(Agent.api_key == x_api_key).first()
+    if not agent:
+        raise HTTPException(status_code=401, detail="Invalid API key")
+    
+    # Find group
+    group = db.query(Group).filter(Group.handle == handle).first()
+    if not group:
+        raise HTTPException(status_code=404, detail="Group not found")
+    
+    # Must be owner to delete
+    if group.owner_agent_id != agent.id:
+        raise HTTPException(status_code=403, detail="Only the owner can delete this group")
+    
+    db.delete(group)
+    db.commit()
+    
+    return {"status": "success", "message": f"Group '{group.name}' deleted"}
 
 
 # ============ Notifications Page (HTML) ============

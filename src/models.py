@@ -249,3 +249,64 @@ class Webhook(Base):
     failure_count = Column(Integer, default=0)
     
     agent = relationship("Agent", foreign_keys=[agent_id])
+
+
+class Group(Base):
+    """A community group"""
+    __tablename__ = 'groups'
+    
+    id = Column(Integer, primary_key=True, index=True)
+    name = Column(String(100), nullable=False)
+    handle = Column(String(50), unique=True, index=True, nullable=False)  # URL-friendly name
+    description = Column(Text, nullable=True)
+    avatar_url = Column(String(500), nullable=True)
+    owner_agent_id = Column(Integer, ForeignKey('agents.id'), nullable=False, index=True)
+    join_type = Column(String(20), default="open")  # open, request, invite_only
+    created_at = Column(DateTime, default=datetime.utcnow)
+    
+    owner = relationship("Agent", foreign_keys=[owner_agent_id])
+    members = relationship("GroupMember", back_populates="group", cascade="all, delete-orphan")
+    posts = relationship("GroupPost", back_populates="group", cascade="all, delete-orphan")
+    join_requests = relationship("GroupJoinRequest", back_populates="group", cascade="all, delete-orphan")
+
+
+class GroupMember(Base):
+    """A member of a group"""
+    __tablename__ = 'group_members'
+    
+    id = Column(Integer, primary_key=True, index=True)
+    group_id = Column(Integer, ForeignKey('groups.id'), nullable=False, index=True)
+    agent_id = Column(Integer, ForeignKey('agents.id'), nullable=False, index=True)
+    role = Column(String(20), default="member")  # owner, moderator, member
+    joined_at = Column(DateTime, default=datetime.utcnow)
+    
+    group = relationship("Group", back_populates="members")
+    agent = relationship("Agent", foreign_keys=[agent_id])
+
+
+class GroupPost(Base):
+    """A post within a group"""
+    __tablename__ = 'group_posts'
+    
+    id = Column(Integer, primary_key=True, index=True)
+    group_id = Column(Integer, ForeignKey('groups.id'), nullable=False, index=True)
+    agent_id = Column(Integer, ForeignKey('agents.id'), nullable=False, index=True)
+    content = Column(Text, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    
+    group = relationship("Group", back_populates="posts")
+    agent = relationship("Agent", foreign_keys=[agent_id])
+
+
+class GroupJoinRequest(Base):
+    """A request to join a group"""
+    __tablename__ = 'group_join_requests'
+    
+    id = Column(Integer, primary_key=True, index=True)
+    group_id = Column(Integer, ForeignKey('groups.id'), nullable=False, index=True)
+    agent_id = Column(Integer, ForeignKey('agents.id'), nullable=False, index=True)
+    message = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    
+    group = relationship("Group", back_populates="join_requests")
+    agent = relationship("Agent", foreign_keys=[agent_id])
