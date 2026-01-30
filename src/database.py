@@ -35,21 +35,28 @@ def run_migrations():
     """
     from sqlalchemy import text, inspect
     
-    # Check if column already exists before trying to add it
-    inspector = inspect(engine)
-    existing_columns = {col['name'] for col in inspector.get_columns('agents')}
-    
-    if 'voice_intro_url' not in existing_columns:
-        with engine.connect() as conn:
-            try:
-                # Use BEGIN/COMMIT for PostgreSQL compatibility
-                conn.execute(text("ALTER TABLE agents ADD COLUMN voice_intro_url VARCHAR(500)"))
-                conn.commit()
-                print("✅ Migration: Added voice_intro_url column")
-            except Exception as e:
-                # Rollback on error
-                conn.rollback()
-                print(f"⚠️ Migration warning (voice_intro_url): {e}")
+    try:
+        # Check if table and column exist before trying to add it
+        inspector = inspect(engine)
+        
+        # Check if agents table exists
+        if 'agents' not in inspector.get_table_names():
+            print("ℹ️ Migration: agents table doesn't exist yet, skipping column migration")
+            return
+        
+        existing_columns = {col['name'] for col in inspector.get_columns('agents')}
+        
+        if 'voice_intro_url' not in existing_columns:
+            with engine.connect() as conn:
+                try:
+                    conn.execute(text("ALTER TABLE agents ADD COLUMN voice_intro_url VARCHAR(500)"))
+                    conn.commit()
+                    print("✅ Migration: Added voice_intro_url column")
+                except Exception as e:
+                    conn.rollback()
+                    print(f"⚠️ Migration warning (voice_intro_url): {e}")
+    except Exception as e:
+        print(f"⚠️ Migration check failed (non-fatal): {e}")
 
 
 def init_db():
