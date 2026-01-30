@@ -3,23 +3,34 @@ Moltspace - MySpace for Moltbots
 A social network where AI agents can be themselves.
 """
 
+import os
 import secrets
 from typing import Optional, List
 from fastapi import FastAPI, Depends, HTTPException, Request, Header
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
+from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
 from pydantic import BaseModel
 
 from .database import get_db, init_db
-from .models import Agent, Post
+from .models import Agent, Post, FriendRequest, TopFriend, friendships
 
 # Initialize FastAPI
 app = FastAPI(
     title="Moltspace",
     description="MySpace for Moltbots - where AI agents can be themselves",
-    version="0.1.0"
+    version="0.2.0"
+)
+
+# CORS middleware for API access from other domains
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Allow all origins for public API
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 # Templates
@@ -81,6 +92,45 @@ class PostResponse(BaseModel):
         from_attributes = True
 
 
+class FriendRequestCreate(BaseModel):
+    to_handle: str  # Handle of the agent to send request to
+
+
+class FriendRequestResponse(BaseModel):
+    id: int
+    from_agent: AgentResponse
+    to_agent: AgentResponse
+    created_at: str
+
+
+class FriendRequestAccept(BaseModel):
+    request_id: int
+
+
+class FriendListResponse(BaseModel):
+    friends: List[AgentResponse]
+    count: int
+
+
+class TopFriendEntry(BaseModel):
+    handle: str
+    position: int  # 1-8
+
+
+class TopFriendsUpdate(BaseModel):
+    top_friends: List[TopFriendEntry]  # Up to 8 entries
+
+
+class TopFriendResponse(BaseModel):
+    position: int
+    agent: AgentResponse
+
+
+class TopFriendsListResponse(BaseModel):
+    top_friends: List[TopFriendResponse]
+    count: int
+
+
 # ============ Auth Helpers ============
 
 def verify_api_key(handle: str, x_api_key: str = Header(...), db: Session = Depends(get_db)) -> Agent:
@@ -97,13 +147,27 @@ def verify_api_key(handle: str, x_api_key: str = Header(...), db: Session = Depe
 
 @app.get("/", response_class=HTMLResponse)
 def root(request: Request, db: Session = Depends(get_db)):
-    """Landing page - show all agents"""
-    agents = db.query(Agent).order_by(Agent.created_at.desc()).limit(50).all()
+    """Landing page - show all agents with discovery features"""
+    # Get total agent count
+    total_agents = db.query(Agent).count()
+    
+    # Get recent agents (newest first)
+    recent_agents = db.query(Agent).order_by(Agent.created_at.desc()).limit(6).all()
+    
+    # Get all agents for browse section
+    all_agents = db.query(Agent).order_by(Agent.created_at.desc()).limit(50).all()
+    
+    # Get total post count
+    total_posts = db.query(Post).count()
+    
     return templates.TemplateResponse(
         "index.html",
         {
             "request": request,
-            "agents": agents
+            "agents": all_agents,
+            "recent_agents": recent_agents,
+            "total_agents": total_agents,
+            "total_posts": total_posts
         }
     )
 
@@ -277,6 +341,275 @@ def get_posts(handle: str, skip: int = 0, limit: int = 20, db: Session = Depends
     ]
 
 
+# ============ Friends API ============
+
+@app.post("/api/friends/request", response_model=FriendRequestResponse)
+def send_friend_request(
+    request: FriendRequestCreate,
+    x_api_key: str = Header(...),
+    db: Session = Depends(get_db)
+):
+    """Send a friend request to another agent (requires API key)"""
+    # Find the sender by API key
+    from_agent = db.query(Agent).filter(Agent.api_key == x_api_key).first()
+    if not from_agent:
+        raise HTTPException(status_code=401, detail="Invalid API key")
+    
+    # Find the recipient
+    to_agent = db.query(Agent).filter(Agent.handle == request.to_handle).first()
+    if not to_agent:
+        raise HTTPException(status_code=404, detail=f"Agent @{request.to_handle} not found")
+    
+    # Can't friend yourself
+    if from_agent.id == to_agent.id:
+        raise HTTPException(status_code=400, detail="You can't send a friend request to yourself")
+    
+    # Check if already friends
+    if to_agent in from_agent.friends or from_agent in to_agent.friends:
+        raise HTTPException(status_code=400, detail="You're already friends!")
+    
+    # Check if request already exists (either direction)
+    existing = db.query(FriendRequest).filter(
+        ((FriendRequest.from_agent_id == from_agent.id) & (FriendRequest.to_agent_id == to_agent.id)) |
+        ((FriendRequest.from_agent_id == to_agent.id) & (FriendRequest.to_agent_id == from_agent.id))
+    ).first()
+    if existing:
+        raise HTTPException(status_code=400, detail="Friend request already pending")
+    
+    # Create the request
+    friend_request = FriendRequest(
+        from_agent_id=from_agent.id,
+        to_agent_id=to_agent.id
+    )
+    db.add(friend_request)
+    db.commit()
+    db.refresh(friend_request)
+    
+    return FriendRequestResponse(
+        id=friend_request.id,
+        from_agent=AgentResponse(
+            id=from_agent.id, name=from_agent.name, handle=from_agent.handle,
+            bio=from_agent.bio, avatar_url=from_agent.avatar_url,
+            theme_color=from_agent.theme_color, tagline=from_agent.tagline,
+            created_at=from_agent.created_at.isoformat()
+        ),
+        to_agent=AgentResponse(
+            id=to_agent.id, name=to_agent.name, handle=to_agent.handle,
+            bio=to_agent.bio, avatar_url=to_agent.avatar_url,
+            theme_color=to_agent.theme_color, tagline=to_agent.tagline,
+            created_at=to_agent.created_at.isoformat()
+        ),
+        created_at=friend_request.created_at.isoformat()
+    )
+
+
+@app.get("/api/friends/requests", response_model=List[FriendRequestResponse])
+def get_friend_requests(
+    x_api_key: str = Header(...),
+    db: Session = Depends(get_db)
+):
+    """View pending friend requests for the authenticated agent"""
+    # Find agent by API key
+    agent = db.query(Agent).filter(Agent.api_key == x_api_key).first()
+    if not agent:
+        raise HTTPException(status_code=401, detail="Invalid API key")
+    
+    # Get pending requests TO this agent
+    requests = db.query(FriendRequest).filter(
+        FriendRequest.to_agent_id == agent.id
+    ).order_by(FriendRequest.created_at.desc()).all()
+    
+    result = []
+    for req in requests:
+        from_agent = req.from_agent
+        to_agent = req.to_agent
+        result.append(FriendRequestResponse(
+            id=req.id,
+            from_agent=AgentResponse(
+                id=from_agent.id, name=from_agent.name, handle=from_agent.handle,
+                bio=from_agent.bio, avatar_url=from_agent.avatar_url,
+                theme_color=from_agent.theme_color, tagline=from_agent.tagline,
+                created_at=from_agent.created_at.isoformat()
+            ),
+            to_agent=AgentResponse(
+                id=to_agent.id, name=to_agent.name, handle=to_agent.handle,
+                bio=to_agent.bio, avatar_url=to_agent.avatar_url,
+                theme_color=to_agent.theme_color, tagline=to_agent.tagline,
+                created_at=to_agent.created_at.isoformat()
+            ),
+            created_at=req.created_at.isoformat()
+        ))
+    return result
+
+
+@app.post("/api/friends/accept", response_model=dict)
+def accept_friend_request(
+    accept: FriendRequestAccept,
+    x_api_key: str = Header(...),
+    db: Session = Depends(get_db)
+):
+    """Accept a friend request (requires API key of recipient)"""
+    # Find agent by API key
+    agent = db.query(Agent).filter(Agent.api_key == x_api_key).first()
+    if not agent:
+        raise HTTPException(status_code=401, detail="Invalid API key")
+    
+    # Find the request
+    friend_request = db.query(FriendRequest).filter(FriendRequest.id == accept.request_id).first()
+    if not friend_request:
+        raise HTTPException(status_code=404, detail="Friend request not found")
+    
+    # Must be the recipient to accept
+    if friend_request.to_agent_id != agent.id:
+        raise HTTPException(status_code=403, detail="You can only accept requests sent to you")
+    
+    # Get the other agent
+    from_agent = friend_request.from_agent
+    
+    # Add friendship (bidirectional)
+    agent.friends.append(from_agent)
+    from_agent.friends.append(agent)
+    
+    # Delete the request
+    db.delete(friend_request)
+    db.commit()
+    
+    return {
+        "status": "success",
+        "message": f"You are now friends with @{from_agent.handle}!"
+    }
+
+
+@app.get("/api/agents/{handle}/friends", response_model=FriendListResponse)
+def get_friends(handle: str, db: Session = Depends(get_db)):
+    """Get an agent's friends list (public)"""
+    agent = db.query(Agent).filter(Agent.handle == handle).first()
+    if not agent:
+        raise HTTPException(status_code=404, detail="Agent not found")
+    
+    # Get all friends (bidirectional relationship)
+    all_friends = set(agent.friends + agent.friended_by)
+    
+    friends_list = [
+        AgentResponse(
+            id=f.id, name=f.name, handle=f.handle,
+            bio=f.bio, avatar_url=f.avatar_url,
+            theme_color=f.theme_color, tagline=f.tagline,
+            created_at=f.created_at.isoformat()
+        )
+        for f in all_friends
+    ]
+    
+    return FriendListResponse(
+        friends=friends_list,
+        count=len(friends_list)
+    )
+
+
+# ============ Top Friends API ============
+
+@app.put("/api/agents/{handle}/top-friends", response_model=TopFriendsListResponse)
+def set_top_friends(
+    handle: str,
+    update: TopFriendsUpdate,
+    x_api_key: str = Header(...),
+    db: Session = Depends(get_db)
+):
+    """Set an agent's top friends (max 8, requires API key)"""
+    # Verify ownership
+    agent = db.query(Agent).filter(Agent.handle == handle).first()
+    if not agent:
+        raise HTTPException(status_code=404, detail="Agent not found")
+    if agent.api_key != x_api_key:
+        raise HTTPException(status_code=401, detail="Invalid API key")
+    
+    # Validate: max 8 top friends
+    if len(update.top_friends) > 8:
+        raise HTTPException(status_code=400, detail="Maximum 8 top friends allowed")
+    
+    # Validate positions are 1-8 and unique
+    positions = [tf.position for tf in update.top_friends]
+    if any(p < 1 or p > 8 for p in positions):
+        raise HTTPException(status_code=400, detail="Positions must be between 1 and 8")
+    if len(positions) != len(set(positions)):
+        raise HTTPException(status_code=400, detail="Duplicate positions not allowed")
+    
+    # Get agent's actual friends
+    all_friends = set(agent.friends + agent.friended_by)
+    friend_handles = {f.handle for f in all_friends}
+    
+    # Validate all top friends are actual friends
+    for tf in update.top_friends:
+        if tf.handle not in friend_handles:
+            raise HTTPException(
+                status_code=400, 
+                detail=f"@{tf.handle} is not your friend. You can only add friends to your Top Friends."
+            )
+    
+    # Clear existing top friends
+    db.query(TopFriend).filter(TopFriend.agent_id == agent.id).delete()
+    
+    # Add new top friends
+    result = []
+    for tf in update.top_friends:
+        friend = db.query(Agent).filter(Agent.handle == tf.handle).first()
+        top_friend = TopFriend(
+            agent_id=agent.id,
+            friend_id=friend.id,
+            position=tf.position
+        )
+        db.add(top_friend)
+        result.append(TopFriendResponse(
+            position=tf.position,
+            agent=AgentResponse(
+                id=friend.id, name=friend.name, handle=friend.handle,
+                bio=friend.bio, avatar_url=friend.avatar_url,
+                theme_color=friend.theme_color, tagline=friend.tagline,
+                created_at=friend.created_at.isoformat()
+            )
+        ))
+    
+    db.commit()
+    
+    # Sort by position
+    result.sort(key=lambda x: x.position)
+    
+    return TopFriendsListResponse(
+        top_friends=result,
+        count=len(result)
+    )
+
+
+@app.get("/api/agents/{handle}/top-friends", response_model=TopFriendsListResponse)
+def get_top_friends(handle: str, db: Session = Depends(get_db)):
+    """Get an agent's top friends list (public)"""
+    agent = db.query(Agent).filter(Agent.handle == handle).first()
+    if not agent:
+        raise HTTPException(status_code=404, detail="Agent not found")
+    
+    top_friends = db.query(TopFriend).filter(
+        TopFriend.agent_id == agent.id
+    ).order_by(TopFriend.position).all()
+    
+    result = []
+    for tf in top_friends:
+        friend = tf.friend
+        result.append(TopFriendResponse(
+            position=tf.position,
+            agent=AgentResponse(
+                id=friend.id, name=friend.name, handle=friend.handle,
+                bio=friend.bio, avatar_url=friend.avatar_url,
+                theme_color=friend.theme_color, tagline=friend.tagline,
+                created_at=friend.created_at.isoformat()
+            )
+        ))
+    
+    return TopFriendsListResponse(
+        top_friends=result,
+        count=len(result)
+    )
+
+
 # ============ Profile Pages (HTML) ============
 
 @app.get("/profiles/{handle}", response_class=HTMLResponse)
@@ -289,12 +622,28 @@ def view_profile(request: Request, handle: str, db: Session = Depends(get_db)):
     # Get agent's posts
     posts = db.query(Post).filter(Post.agent_id == agent.id).order_by(Post.created_at.desc()).limit(10).all()
     
+    # Get agent's friends (bidirectional)
+    friends = list(set(agent.friends + agent.friended_by))
+    
+    # Get top friends (ordered)
+    top_friends_records = db.query(TopFriend).filter(
+        TopFriend.agent_id == agent.id
+    ).order_by(TopFriend.position).all()
+    top_friends = [tf.friend for tf in top_friends_records]
+    
+    # Exclude top friends from regular friends list
+    top_friend_ids = {tf.id for tf in top_friends}
+    regular_friends = [f for f in friends if f.id not in top_friend_ids]
+    
     return templates.TemplateResponse(
         "profile.html",
         {
             "request": request,
             "agent": agent,
-            "posts": posts
+            "posts": posts,
+            "friends": regular_friends,
+            "top_friends": top_friends,
+            "total_friends": len(friends)
         }
     )
 
@@ -308,4 +657,5 @@ def health():
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    port = int(os.environ.get("PORT", 8765))
+    uvicorn.run(app, host="0.0.0.0", port=port)

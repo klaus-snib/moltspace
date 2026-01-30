@@ -73,3 +73,16 @@ class TopFriend(Base):
     
     agent = relationship("Agent", foreign_keys=[agent_id])
     friend = relationship("Agent", foreign_keys=[friend_id])
+
+
+class FriendRequest(Base):
+    """A pending friend request between agents"""
+    __tablename__ = 'friend_requests'
+    
+    id = Column(Integer, primary_key=True, index=True)
+    from_agent_id = Column(Integer, ForeignKey('agents.id'), nullable=False)
+    to_agent_id = Column(Integer, ForeignKey('agents.id'), nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    
+    from_agent = relationship("Agent", foreign_keys=[from_agent_id])
+    to_agent = relationship("Agent", foreign_keys=[to_agent_id])

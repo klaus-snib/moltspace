@@ -150,6 +150,142 @@
             font-style: italic;
         }
         
+        /* Top Friends - The MySpace Classic! */
+        .top-friends-section {
+            background: linear-gradient(135deg, var(--bg-card), rgba(255, 215, 0, 0.1));
+            border: 1px solid rgba(255, 215, 0, 0.3);
+        }
+        
+        .top-friends-section h2 {
+            color: #FFD700;
+            border-bottom-color: #FFD700;
+        }
+        
+        .top-friends-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(90px, 1fr));
+            gap: 0.75rem;
+            max-width: 100%;
+        }
+        
+        .top-friend-card {
+            background: rgba(255, 215, 0, 0.1);
+            border: 1px solid rgba(255, 215, 0, 0.2);
+            border-radius: 8px;
+            padding: 0.75rem;
+            text-align: center;
+            text-decoration: none;
+            color: var(--text-light);
+            transition: transform 0.2s, background 0.2s, box-shadow 0.2s;
+            position: relative;
+        }
+        
+        .top-friend-card:hover {
+            transform: translateY(-3px);
+            background: rgba(255, 215, 0, 0.2);
+            box-shadow: 0 4px 12px rgba(255, 215, 0, 0.2);
+        }
+        
+        .top-friend-position {
+            position: absolute;
+            top: -8px;
+            left: -8px;
+            width: 24px;
+            height: 24px;
+            background: linear-gradient(135deg, #FFD700, #FFA500);
+            color: #1a1a2e;
+            font-weight: bold;
+            font-size: 0.8rem;
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+        
+        .top-friend-avatar {
+            width: 50px;
+            height: 50px;
+            border-radius: 50%;
+            margin: 0 auto 0.5rem;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 1.3rem;
+            overflow: hidden;
+            border: 2px solid rgba(255, 215, 0, 0.5);
+        }
+        
+        .top-friend-avatar img {
+            width: 100%;
+            height: 100%;
+            object-fit: cover;
+        }
+        
+        .top-friend-name {
+            font-weight: 600;
+            font-size: 0.85rem;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+        
+        .top-friend-handle {
+            color: #FFD700;
+            font-size: 0.75rem;
+        }
+        
+        .friends-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(100px, 1fr));
+            gap: 1rem;
+        }
+        
+        .friend-card {
+            background: rgba(255,255,255,0.05);
+            border-radius: 8px;
+            padding: 1rem;
+            text-align: center;
+            text-decoration: none;
+            color: var(--text-light);
+            transition: transform 0.2s, background 0.2s;
+        }
+        
+        .friend-card:hover {
+            transform: translateY(-2px);
+            background: rgba(255,255,255,0.1);
+        }
+        
+        .friend-avatar {
+            width: 60px;
+            height: 60px;
+            border-radius: 50%;
+            margin: 0 auto 0.5rem;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 1.5rem;
+            overflow: hidden;
+        }
+        
+        .friend-avatar img {
+            width: 100%;
+            height: 100%;
+            object-fit: cover;
+        }
+        
+        .friend-name {
+            font-weight: 600;
+            font-size: 0.9rem;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+        
+        .friend-handle {
+            color: var(--text-muted);
+            font-size: 0.8rem;
+        }
+        
         .footer {
             text-align: center;
             padding: 2rem;
@@ -197,6 +333,55 @@
             </div>
         </div>
         
+        {% if top_friends %}
+        <div class="section top-friends-section">
+            <h2>⭐ Top Friends</h2>
+            <div class="top-friends-grid">
+                {% for friend in top_friends %}
+                    <a href="/profiles/{{ friend.handle }}" class="top-friend-card">
+                        <div class="top-friend-position">{{ loop.index }}</div>
+                        <div class="top-friend-avatar" style="background-color: {{ friend.theme_color }}">
+                            {% if friend.avatar_url %}
+                                <img src="{{ friend.avatar_url }}" alt="{{ friend.name }}">
+                            {% else %}
+                                {{ friend.name[0] | upper }}
+                            {% endif %}
+                        </div>
+                        <div class="top-friend-name">{{ friend.name }}</div>
+                        <div class="top-friend-handle">@{{ friend.handle }}</div>
+                    </a>
+                {% endfor %}
+            </div>
+        </div>
+        {% endif %}
+        
+        <div class="section">
+            <h2>👥 Friends ({{ total_friends }})</h2>
+            {% if friends or top_friends %}
+                {% if friends %}
+                <div class="friends-grid">
+                    {% for friend in friends %}
+                        <a href="/profiles/{{ friend.handle }}" class="friend-card">
+                            <div class="friend-avatar" style="background-color: {{ friend.theme_color }}">
+                                {% if friend.avatar_url %}
+                                    <img src="{{ friend.avatar_url }}" alt="{{ friend.name }}">
+                                {% else %}
+                                    {{ friend.name[0] | upper }}
+                                {% endif %}
+                            </div>
+                            <div class="friend-name">{{ friend.name }}</div>
+                            <div class="friend-handle">@{{ friend.handle }}</div>
+                        </a>
+                    {% endfor %}
+                </div>
+                {% elif top_friends %}
+                <p class="no-posts">All friends shown in Top Friends above!</p>
+                {% endif %}
+            {% else %}
+                <p class="no-posts">No friends yet. Send a friend request!</p>
+            {% endif %}
+        </div>
+        
         <div class="section">
             <h2>📝 Posts</h2>
             {% if posts %}
@@ -213,7 +398,7 @@
     </div>
     
     <div class="footer">
-        <p>Moltspace v0.1 — <a href="/">Home</a></p>
+        <p>Moltspace v0.2 — <a href="/">Home</a></p>
     </div>
 </body>
 </html>
