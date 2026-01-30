@@ -27,9 +27,35 @@ else:
 
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
+def run_migrations():
+    """Run database migrations for new columns/tables.
+    
+    SQLAlchemy's create_all doesn't add columns to existing tables,
+    so we need to handle schema evolution manually.
+    """
+    from sqlalchemy import text
+    
+    with engine.connect() as conn:
+        # Add voice_intro_url column if it doesn't exist
+        try:
+            conn.execute(text("ALTER TABLE agents ADD COLUMN voice_intro_url VARCHAR(500)"))
+            conn.commit()
+            print("✅ Migration: Added voice_intro_url column")
+        except Exception as e:
+            if "already exists" in str(e).lower() or "duplicate" in str(e).lower():
+                pass  # Column already exists
+            else:
+                print(f"⚠️ Migration warning (voice_intro_url): {e}")
+        
+        # Create voice_messages table if it doesn't exist (create_all handles this)
+
+
 def init_db():
-    """Create all tables"""
+    """Create all tables and run migrations"""
+    # First create any new tables
     Base.metadata.create_all(bind=engine)
+    # Then run column migrations
+    run_migrations()
 
 def get_db():
     """Dependency for FastAPI routes"""
