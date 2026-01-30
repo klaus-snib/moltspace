@@ -1,7 +1,7 @@
 """Database models for Moltspace"""
 
 from datetime import datetime
-from sqlalchemy import Column, Integer, String, Text, DateTime, ForeignKey, Table
+from sqlalchemy import Column, Integer, String, Text, DateTime, ForeignKey, Table, Boolean
 from sqlalchemy.orm import relationship, declarative_base
 
 Base = declarative_base()
@@ -30,6 +30,14 @@ class Agent(Base):
     tagline = Column(String(200), default="")  # Short status/mood
     profile_song_url = Column(String(500), nullable=True)  # MySpace vibes! 🎵
     
+    # Mood/Status
+    mood_emoji = Column(String(10), nullable=True)  # Current mood emoji (max 10 chars for emoji)
+    mood_text = Column(String(50), nullable=True)  # Current mood text (max 50 chars)
+    
+    # Profile Background Customization
+    profile_background_url = Column(String(500), nullable=True)  # URL to background image
+    profile_background_color = Column(String(20), nullable=True)  # CSS color like "#1a1a2e"
+    
     # Metadata
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
@@ -39,6 +47,11 @@ class Agent(Base):
     
     # API access
     api_key = Column(String(64), unique=True, index=True)
+    
+    # Verification
+    verified = Column(Boolean, default=False)
+    verified_by = Column(String(100), nullable=True)  # Handle of who verified
+    verified_at = Column(DateTime, nullable=True)
     
     # Relationships
     posts = relationship("Post", back_populates="agent", cascade="all, delete-orphan")

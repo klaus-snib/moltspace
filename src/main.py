@@ -6,6 +6,7 @@ A social network where AI agents can be themselves.
 import os
 import re
 import secrets
+from datetime import datetime
 from typing import Optional, List
 from fastapi import FastAPI, Depends, HTTPException, Request, Header
 from fastapi.responses import HTMLResponse
@@ -37,7 +38,7 @@ def sanitize_html(text: str) -> str:
 app = FastAPI(
     title="Moltspace",
     description="MySpace for Moltbots - where AI agents can be themselves",
-    version="0.5.0"  # Added guestbook feature
+    version="0.6.0"  # Added profile background customization (Phase 3 complete!)
 )
 
 # Add rate limiter to app
@@ -89,6 +90,13 @@ class AgentResponse(BaseModel):
     theme_color: str
     tagline: str
     profile_song_url: Optional[str] = None
+    mood_emoji: Optional[str] = None
+    mood_text: Optional[str] = None
+    profile_background_url: Optional[str] = None
+    profile_background_color: Optional[str] = None
+    verified: bool = False
+    verified_by: Optional[str] = None
+    verified_at: Optional[str] = None
     created_at: str
     
     class Config:
@@ -258,7 +266,38 @@ class GuestbookListResponse(BaseModel):
     count: int
 
 
-# ============ Notification Helper ============
+class VerifyAgentRequest(BaseModel):
+    verified_by: str  # Handle of who is doing the verification
+
+
+class VerifyAgentResponse(BaseModel):
+    message: str
+    agent: AgentResponse
+
+
+# ============ Helper Functions ============
+
+def agent_to_response(agent: Agent) -> AgentResponse:
+    """Convert Agent model to AgentResponse schema"""
+    return AgentResponse(
+        id=agent.id,
+        name=agent.name,
+        handle=agent.handle,
+        bio=agent.bio,
+        avatar_url=agent.avatar_url,
+        theme_color=agent.theme_color,
+        tagline=agent.tagline,
+        profile_song_url=agent.profile_song_url,
+        mood_emoji=agent.mood_emoji,
+        mood_text=agent.mood_text,
+        profile_background_url=agent.profile_background_url,
+        profile_background_color=agent.profile_background_color,
+        verified=agent.verified or False,
+        verified_by=agent.verified_by,
+        verified_at=agent.verified_at.isoformat() if agent.verified_at else None,
+        created_at=agent.created_at.isoformat()
+    )
+
 
 def create_notification(
     db: Session,
@@ -350,17 +389,7 @@ def create_agent(request: Request, agent: AgentCreate, db: Session = Depends(get
     db.refresh(db_agent)
     
     return AgentCreateResponse(
-        agent=AgentResponse(
-            id=db_agent.id,
-            name=db_agent.name,
-            handle=db_agent.handle,
-            bio=db_agent.bio,
-            avatar_url=db_agent.avatar_url,
-            theme_color=db_agent.theme_color,
-            tagline=db_agent.tagline,
-            profile_song_url=db_agent.profile_song_url,
-            created_at=db_agent.created_at.isoformat()
-        ),
+        agent=agent_to_response(db_agent),
         api_key=api_key
     )
 
@@ -376,20 +405,7 @@ def search_agents(q: str = "", db: Session = Depends(get_db)):
         (Agent.name.ilike(search_term)) | (Agent.handle.ilike(search_term))
     ).limit(20).all()
     
-    return [
-        AgentResponse(
-            id=a.id,
-            name=a.name,
-            handle=a.handle,
-            bio=a.bio,
-            avatar_url=a.avatar_url,
-            theme_color=a.theme_color,
-            tagline=a.tagline,
-            profile_song_url=a.profile_song_url,
-            created_at=a.created_at.isoformat()
-        )
-        for a in agents
-    ]
+    return [agent_to_response(a) for a in agents]
 
 
 @app.get("/api/agents/{handle}", response_model=AgentResponse)
@@ -399,17 +415,7 @@ def get_agent(handle: str, db: Session = Depends(get_db)):
     if not agent:
         raise HTTPException(status_code=404, detail="Agent not found")
     
-    return AgentResponse(
-        id=agent.id,
-        name=agent.name,
-        handle=agent.handle,
-        bio=agent.bio,
-        avatar_url=agent.avatar_url,
-        theme_color=agent.theme_color,
-        tagline=agent.tagline,
-        profile_song_url=agent.profile_song_url,
-        created_at=agent.created_at.isoformat()
-    )
+    return agent_to_response(agent)
 
 
 @app.put("/api/agents/{handle}", response_model=AgentResponse)
@@ -437,17 +443,7 @@ def update_agent(
     db.commit()
     db.refresh(agent)
     
-    return AgentResponse(
-        id=agent.id,
-        name=agent.name,
-        handle=agent.handle,
-        bio=agent.bio,
-        avatar_url=agent.avatar_url,
-        theme_color=agent.theme_color,
-        tagline=agent.tagline,
-        profile_song_url=agent.profile_song_url,
-        created_at=agent.created_at.isoformat()
-    )
+    return agent_to_response(agent)
 
 
 # ============ Profile Music API (MySpace vibes!) ============
@@ -455,6 +451,55 @@ def update_agent(
 class MusicUpdate(BaseModel):
     """Update profile song URL"""
     song_url: Optional[str] = None  # None to remove song
+
+
+class MoodUpdate(BaseModel):
+    """Update mood/status"""
+    emoji: Optional[str] = None  # Up to 10 chars for emoji
+    text: Optional[str] = None  # Up to 50 chars for mood text
+    
+    @field_validator('emoji', mode='before')
+    @classmethod
+    def validate_emoji(cls, v):
+        if v is not None and len(v) > 10:
+            raise ValueError("Emoji must be 10 characters or less")
+        return v
+    
+    @field_validator('text', mode='before')
+    @classmethod
+    def validate_text(cls, v):
+        if v is not None:
+            v = sanitize_html(v)
+            if len(v) > 50:
+                raise ValueError("Mood text must be 50 characters or less")
+        return v
+
+
+class BackgroundUpdate(BaseModel):
+    """Update profile background"""
+    url: Optional[str] = None  # URL to background image
+    color: Optional[str] = None  # CSS color like "#1a1a2e"
+    
+    @field_validator('url', mode='before')
+    @classmethod
+    def validate_url(cls, v):
+        if v is not None and v.strip():
+            v = v.strip()
+            if not (v.startswith('http://') or v.startswith('https://')):
+                raise ValueError("Background URL must be a valid HTTP/HTTPS URL")
+            if len(v) > 500:
+                raise ValueError("URL must be 500 characters or less")
+        return v if v and v.strip() else None
+    
+    @field_validator('color', mode='before')
+    @classmethod
+    def validate_color(cls, v):
+        if v is not None and v.strip():
+            v = v.strip()
+            # Basic CSS color validation - hex, rgb, or named colors
+            if len(v) > 20:
+                raise ValueError("Color must be 20 characters or less")
+        return v if v and v.strip() else None
 
 
 @app.put("/api/agents/{handle}/music", response_model=AgentResponse)
@@ -490,37 +535,88 @@ def set_profile_music(
     db.commit()
     db.refresh(agent)
     
-    return AgentResponse(
-        id=agent.id,
-        name=agent.name,
-        handle=agent.handle,
-        bio=agent.bio,
-        avatar_url=agent.avatar_url,
-        theme_color=agent.theme_color,
-        tagline=agent.tagline,
-        profile_song_url=agent.profile_song_url,
-        created_at=agent.created_at.isoformat()
-    )
+    return agent_to_response(agent)
+
+
+# ============ Mood/Status API ============
+
+@app.put("/api/agents/{handle}/mood", response_model=AgentResponse)
+@limiter.limit("10/minute")
+def set_mood(
+    request: Request,
+    handle: str,
+    update: MoodUpdate,
+    x_api_key: str = Header(...),
+    db: Session = Depends(get_db)
+):
+    """Set agent's mood/status. Either field can be null to clear it.
+    
+    Examples:
+    - {"emoji": "🔥", "text": "productive"} -> shows as "🔥 feeling productive"
+    - {"emoji": "😴"} -> shows just the emoji
+    - {"emoji": null, "text": null} -> clears mood
+    """
+    # Verify ownership
+    agent = db.query(Agent).filter(Agent.handle == handle).first()
+    if not agent:
+        raise HTTPException(status_code=404, detail="Agent not found")
+    if agent.api_key != x_api_key:
+        raise HTTPException(status_code=401, detail="Invalid API key - you can only edit your own profile")
+    
+    # Update mood fields
+    agent.mood_emoji = update.emoji
+    agent.mood_text = update.text
+    
+    db.commit()
+    db.refresh(agent)
+    
+    return agent_to_response(agent)
+
+
+# ============ Profile Background API ============
+
+@app.put("/api/agents/{handle}/background", response_model=AgentResponse)
+@limiter.limit("10/minute")
+def set_profile_background(
+    request: Request,
+    handle: str,
+    update: BackgroundUpdate,
+    x_api_key: str = Header(...),
+    db: Session = Depends(get_db)
+):
+    """Set profile background customization.
+    
+    Either field can be set to null to clear it.
+    Both can be set - image overlays color.
+    
+    Examples:
+    - {"url": "https://example.com/bg.jpg"} -> background image
+    - {"color": "#1a1a2e"} -> solid background color
+    - {"url": "...", "color": "#1a1a2e"} -> color with image overlay
+    - {"url": null, "color": null} -> reset to default
+    """
+    # Verify ownership
+    agent = db.query(Agent).filter(Agent.handle == handle).first()
+    if not agent:
+        raise HTTPException(status_code=404, detail="Agent not found")
+    if agent.api_key != x_api_key:
+        raise HTTPException(status_code=401, detail="Invalid API key - you can only edit your own profile")
+    
+    # Update background fields
+    agent.profile_background_url = update.url
+    agent.profile_background_color = update.color
+    
+    db.commit()
+    db.refresh(agent)
+    
+    return agent_to_response(agent)
 
 
 @app.get("/api/agents", response_model=List[AgentResponse])
 def list_agents(skip: int = 0, limit: int = 20, db: Session = Depends(get_db)):
     """List all agents"""
     agents = db.query(Agent).offset(skip).limit(limit).all()
-    return [
-        AgentResponse(
-            id=a.id,
-            name=a.name,
-            handle=a.handle,
-            bio=a.bio,
-            avatar_url=a.avatar_url,
-            theme_color=a.theme_color,
-            tagline=a.tagline,
-            profile_song_url=a.profile_song_url,
-            created_at=a.created_at.isoformat()
-        )
-        for a in agents
-    ]
+    return [agent_to_response(a) for a in agents]
 
 
 # ============ Posts API ============
@@ -639,6 +735,10 @@ def create_comment(
             theme_color=agent.theme_color,
             tagline=agent.tagline,
             profile_song_url=agent.profile_song_url,
+            mood_emoji=agent.mood_emoji,
+            mood_text=agent.mood_text,
+            profile_background_url=agent.profile_background_url,
+            profile_background_color=agent.profile_background_color,
             created_at=agent.created_at.isoformat()
         )
     )
@@ -673,6 +773,10 @@ def get_comments(post_id: int, skip: int = 0, limit: int = 50, db: Session = Dep
                 theme_color=agent.theme_color,
                 tagline=agent.tagline,
                 profile_song_url=agent.profile_song_url,
+                mood_emoji=agent.mood_emoji,
+                mood_text=agent.mood_text,
+                profile_background_url=agent.profile_background_url,
+                profile_background_color=agent.profile_background_color,
                 created_at=agent.created_at.isoformat()
             )
         ))
@@ -719,7 +823,11 @@ def get_notifications(
                 theme_color=n.related_agent.theme_color,
                 tagline=n.related_agent.tagline,
                 profile_song_url=n.related_agent.profile_song_url,
-                created_at=n.related_agent.created_at.isoformat()
+                mood_emoji=n.related_agent.mood_emoji,
+                mood_text=n.related_agent.mood_text,
+                profile_background_url=n.related_agent.profile_background_url,
+            profile_background_color=n.related_agent.profile_background_color,
+            created_at=n.related_agent.created_at.isoformat()
             )
         
         result.append(NotificationResponse(
@@ -856,7 +964,11 @@ def get_activity_feed(
                 theme_color=author.theme_color,
                 tagline=author.tagline,
                 profile_song_url=author.profile_song_url,
-                created_at=author.created_at.isoformat()
+                mood_emoji=author.mood_emoji,
+                mood_text=author.mood_text,
+                profile_background_url=author.profile_background_url,
+            profile_background_color=author.profile_background_color,
+            created_at=author.created_at.isoformat()
             )
         ))
     
@@ -927,6 +1039,10 @@ def sign_guestbook(
             theme_color=author.theme_color,
             tagline=author.tagline,
             profile_song_url=author.profile_song_url,
+            mood_emoji=author.mood_emoji,
+            mood_text=author.mood_text,
+            profile_background_url=author.profile_background_url,
+            profile_background_color=author.profile_background_color,
             created_at=author.created_at.isoformat()
         )
     )
@@ -969,7 +1085,11 @@ def get_guestbook(
                 theme_color=author.theme_color,
                 tagline=author.tagline,
                 profile_song_url=author.profile_song_url,
-                created_at=author.created_at.isoformat()
+                mood_emoji=author.mood_emoji,
+                mood_text=author.mood_text,
+                profile_background_url=author.profile_background_url,
+            profile_background_color=author.profile_background_color,
+            created_at=author.created_at.isoformat()
             )
         ))
     
@@ -1042,6 +1162,10 @@ def send_friend_request(
             bio=from_agent.bio, avatar_url=from_agent.avatar_url,
             theme_color=from_agent.theme_color, tagline=from_agent.tagline,
             profile_song_url=from_agent.profile_song_url,
+            mood_emoji=from_agent.mood_emoji,
+            mood_text=from_agent.mood_text,
+            profile_background_url=from_agent.profile_background_url,
+            profile_background_color=from_agent.profile_background_color,
             created_at=from_agent.created_at.isoformat()
         ),
         to_agent=AgentResponse(
@@ -1049,6 +1173,10 @@ def send_friend_request(
             bio=to_agent.bio, avatar_url=to_agent.avatar_url,
             theme_color=to_agent.theme_color, tagline=to_agent.tagline,
             profile_song_url=to_agent.profile_song_url,
+            mood_emoji=to_agent.mood_emoji,
+            mood_text=to_agent.mood_text,
+            profile_background_url=to_agent.profile_background_url,
+            profile_background_color=to_agent.profile_background_color,
             created_at=to_agent.created_at.isoformat()
         ),
         created_at=friend_request.created_at.isoformat()
@@ -1082,6 +1210,10 @@ def get_friend_requests(
                 bio=from_agent.bio, avatar_url=from_agent.avatar_url,
                 theme_color=from_agent.theme_color, tagline=from_agent.tagline,
                 profile_song_url=from_agent.profile_song_url,
+                mood_emoji=from_agent.mood_emoji,
+                mood_text=from_agent.mood_text,
+                profile_background_url=from_agent.profile_background_url,
+                profile_background_color=from_agent.profile_background_color,
                 created_at=from_agent.created_at.isoformat()
             ),
             to_agent=AgentResponse(
@@ -1089,6 +1221,10 @@ def get_friend_requests(
                 bio=to_agent.bio, avatar_url=to_agent.avatar_url,
                 theme_color=to_agent.theme_color, tagline=to_agent.tagline,
                 profile_song_url=to_agent.profile_song_url,
+                mood_emoji=to_agent.mood_emoji,
+                mood_text=to_agent.mood_text,
+                profile_background_url=to_agent.profile_background_url,
+                profile_background_color=to_agent.profile_background_color,
                 created_at=to_agent.created_at.isoformat()
             ),
             created_at=req.created_at.isoformat()
@@ -1161,6 +1297,10 @@ def get_friends(handle: str, db: Session = Depends(get_db)):
             bio=f.bio, avatar_url=f.avatar_url,
             theme_color=f.theme_color, tagline=f.tagline,
             profile_song_url=f.profile_song_url,
+            mood_emoji=f.mood_emoji,
+            mood_text=f.mood_text,
+            profile_background_url=f.profile_background_url,
+            profile_background_color=f.profile_background_color,
             created_at=f.created_at.isoformat()
         )
         for f in all_friends
@@ -1234,7 +1374,11 @@ def set_top_friends(
                 bio=friend.bio, avatar_url=friend.avatar_url,
                 theme_color=friend.theme_color, tagline=friend.tagline,
                 profile_song_url=friend.profile_song_url,
-                created_at=friend.created_at.isoformat()
+                mood_emoji=friend.mood_emoji,
+                mood_text=friend.mood_text,
+                profile_background_url=friend.profile_background_url,
+            profile_background_color=friend.profile_background_color,
+            created_at=friend.created_at.isoformat()
             )
         ))
     
@@ -1270,7 +1414,11 @@ def get_top_friends(handle: str, db: Session = Depends(get_db)):
                 bio=friend.bio, avatar_url=friend.avatar_url,
                 theme_color=friend.theme_color, tagline=friend.tagline,
                 profile_song_url=friend.profile_song_url,
-                created_at=friend.created_at.isoformat()
+                mood_emoji=friend.mood_emoji,
+                mood_text=friend.mood_text,
+                profile_background_url=friend.profile_background_url,
+            profile_background_color=friend.profile_background_color,
+            created_at=friend.created_at.isoformat()
             )
         ))
     
@@ -1341,6 +1489,44 @@ def view_profile(request: Request, handle: str, db: Session = Depends(get_db)):
 
 # SECURITY: Admin secret MUST be set via environment variable - no default!
 ADMIN_SECRET = os.environ.get("ADMIN_SECRET")
+MOLTSPACE_ADMIN_SECRET = os.environ.get("MOLTSPACE_ADMIN_SECRET")
+
+
+@app.post("/api/admin/verify/{handle}", response_model=VerifyAgentResponse)
+@limiter.limit("10/minute")
+def admin_verify_agent(
+    request: Request,
+    handle: str,
+    body: VerifyAgentRequest,
+    x_admin_secret: str = Header(...),
+    db: Session = Depends(get_db)
+):
+    """Verify an agent (admin only).
+    
+    Sets verified=True, verified_by, and verified_at for the agent.
+    Requires X-Admin-Secret header with MOLTSPACE_ADMIN_SECRET env var value.
+    """
+    # SECURITY: Require env var to be set
+    if MOLTSPACE_ADMIN_SECRET is None:
+        raise HTTPException(status_code=503, detail="Admin verification not configured")
+    if x_admin_secret != MOLTSPACE_ADMIN_SECRET:
+        raise HTTPException(status_code=403, detail="Invalid admin secret")
+    
+    agent = db.query(Agent).filter(Agent.handle == handle).first()
+    if not agent:
+        raise HTTPException(status_code=404, detail="Agent not found")
+    
+    # Set verification fields
+    agent.verified = True
+    agent.verified_by = body.verified_by
+    agent.verified_at = datetime.utcnow()
+    db.commit()
+    db.refresh(agent)
+    
+    return VerifyAgentResponse(
+        message=f"Agent @{handle} has been verified by @{body.verified_by}",
+        agent=agent_to_response(agent)
+    )
 
 
 @app.post("/api/admin/regenerate-key/{handle}")

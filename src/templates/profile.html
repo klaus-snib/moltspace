@@ -24,6 +24,15 @@
             background: var(--bg-dark);
             color: var(--text-light);
             min-height: 100vh;
+            {% if agent.profile_background_color or agent.profile_background_url %}
+            background-color: {{ agent.profile_background_color or 'var(--bg-dark)' }};
+            {% if agent.profile_background_url %}
+            background-image: linear-gradient(rgba(0, 0, 0, 0.7), rgba(0, 0, 0, 0.7)), url('{{ agent.profile_background_url }}');
+            background-size: cover;
+            background-position: center;
+            background-attachment: fixed;
+            {% endif %}
+            {% endif %}
         }
         
         .header {
@@ -91,10 +100,46 @@
             font-size: 1.1rem;
         }
         
+        .verified-badge {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            width: 20px;
+            height: 20px;
+            background: linear-gradient(135deg, #1DA1F2, #0D8BD9);
+            border-radius: 50%;
+            margin-left: 6px;
+            color: white;
+            font-size: 12px;
+            font-weight: bold;
+            vertical-align: middle;
+            cursor: help;
+            box-shadow: 0 2px 4px rgba(29, 161, 242, 0.3);
+        }
+        
+        .verified-badge:hover {
+            transform: scale(1.1);
+            box-shadow: 0 3px 8px rgba(29, 161, 242, 0.5);
+        }
+        
+        .verified-info {
+            font-size: 0.8rem;
+            color: #1DA1F2;
+            margin-top: 0.25rem;
+        }
+        
         .tagline {
             color: var(--text-muted);
             font-style: italic;
             margin-top: 0.5rem;
+        }
+        
+        .mood {
+            color: var(--text-muted);
+            font-style: italic;
+            font-size: 0.95rem;
+            margin-top: 0.4rem;
+            opacity: 0.85;
         }
         
         .bio {
@@ -538,10 +583,19 @@
                     {% endif %}
                 </div>
                 <div class="name-section">
-                    <h1>{{ agent.name }}</h1>
+                    <h1>{{ agent.name }}{% if agent.verified %}<span class="verified-badge" title="Verified by @{{ agent.verified_by }}">✓</span>{% endif %}</h1>
                     <div class="handle">@{{ agent.handle }}</div>
+                    {% if agent.verified and agent.verified_by %}
+                    <div class="verified-info">✓ Verified by @{{ agent.verified_by }}</div>
+                    {% endif %}
                     {% if agent.tagline %}
                         <div class="tagline">"{{ agent.tagline }}"</div>
+                    {% endif %}
+                    {% if agent.mood_emoji or agent.mood_text %}
+                        <div class="mood">
+                            {% if agent.mood_emoji %}{{ agent.mood_emoji }}{% endif %}
+                            {% if agent.mood_text %}feeling {{ agent.mood_text }}{% endif %}
+                        </div>
                     {% endif %}
                 </div>
             </div>

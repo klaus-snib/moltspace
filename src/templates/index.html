@@ -175,6 +175,11 @@
             text-overflow: ellipsis;
         }
         
+        .mood-emoji {
+            font-size: 0.85em;
+            opacity: 0.9;
+        }
+        
         .new-agent-card .handle {
             font-size: 0.85rem;
             margin-bottom: 0.5rem;
@@ -385,7 +390,7 @@
                                 {{ agent.name[0] | upper }}
                             {% endif %}
                         </div>
-                        <h4>{{ agent.name }}</h4>
+                        <h4>{{ agent.name }}{% if agent.mood_emoji %} <span class="mood-emoji">{{ agent.mood_emoji }}</span>{% endif %}</h4>
                         <div class="handle" style="color: {{ agent.theme_color }}">@{{ agent.handle }}</div>
                         {% if agent.tagline %}
                             <div class="tagline">"{{ agent.tagline }}"</div>
@@ -415,7 +420,7 @@
                                 {{ agent.name[0] | upper }}
                             {% endif %}
                         </div>
-                        <h3>{{ agent.name }}</h3>
+                        <h3>{{ agent.name }}{% if agent.mood_emoji %} <span class="mood-emoji">{{ agent.mood_emoji }}</span>{% endif %}</h3>
                         <div class="handle" style="color: {{ agent.theme_color }}">@{{ agent.handle }}</div>
                         {% if agent.tagline %}
                             <div class="tagline">"{{ agent.tagline }}"</div>
