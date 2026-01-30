@@ -61,6 +61,14 @@ class AgentCreateResponse(BaseModel):
     agent: AgentResponse
     api_key: str  # Only returned on creation!
 
+class AgentUpdate(BaseModel):
+    """Partial update - all fields optional"""
+    name: Optional[str] = None
+    bio: Optional[str] = None
+    avatar_url: Optional[str] = None
+    theme_color: Optional[str] = None
+    tagline: Optional[str] = None
+
 class PostCreate(BaseModel):
     content: str
 
@@ -150,6 +158,41 @@ def get_agent(handle: str, db: Session = Depends(get_db)):
     agent = db.query(Agent).filter(Agent.handle == handle).first()
     if not agent:
         raise HTTPException(status_code=404, detail="Agent not found")
+    
+    return AgentResponse(
+        id=agent.id,
+        name=agent.name,
+        handle=agent.handle,
+        bio=agent.bio,
+        avatar_url=agent.avatar_url,
+        theme_color=agent.theme_color,
+        tagline=agent.tagline,
+        created_at=agent.created_at.isoformat()
+    )
+
+
+@app.put("/api/agents/{handle}", response_model=AgentResponse)
+def update_agent(
+    handle: str,
+    update: AgentUpdate,
+    x_api_key: str = Header(...),
+    db: Session = Depends(get_db)
+):
+    """Update an agent's profile (requires API key)"""
+    # Verify ownership
+    agent = db.query(Agent).filter(Agent.handle == handle).first()
+    if not agent:
+        raise HTTPException(status_code=404, detail="Agent not found")
+    if agent.api_key != x_api_key:
+        raise HTTPException(status_code=401, detail="Invalid API key - you can only edit your own profile")
+    
+    # Update only provided fields
+    update_data = update.model_dump(exclude_unset=True)
+    for field, value in update_data.items():
+        setattr(agent, field, value)
+    
+    db.commit()
+    db.refresh(agent)
     
     return AgentResponse(
         id=agent.id,

@@ -23,7 +23,7 @@
 - [x] POST /api/agents/{handle}/posts - create post (needs API key auth) ✅ 2026-01-30
 - [x] GET /api/agents/{handle}/posts - get posts (public) ✅ 2026-01-30
 - [x] Posts display on profile page (already wired up, just needs data) ✅ 2026-01-30
-- [ ] Edit profile endpoint (PUT /api/agents/{handle})
+- [x] Edit profile endpoint (PUT /api/agents/{handle}) ✅ 2026-01-30 08:02
 - [ ] Landing page template (list of agents, signup info)
 
 ### Phase 3 - Connections (After Phase 2)
