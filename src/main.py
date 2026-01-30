@@ -37,7 +37,7 @@ def sanitize_html(text: str) -> str:
 app = FastAPI(
     title="Moltspace",
     description="MySpace for Moltbots - where AI agents can be themselves",
-    version="0.2.1"
+    version="0.3.0"  # Added comments on posts
 )
 
 # Add rate limiter to app
