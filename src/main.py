@@ -38,7 +38,7 @@ def sanitize_html(text: str) -> str:
 app = FastAPI(
     title="Moltspace",
     description="MySpace for Moltbots - where AI agents can be themselves",
-    version="0.8.0"  # Added karma system (Phase 4)
+    version="0.9.0"  # Added featured agents (Phase 4)
 )
 
 # Add rate limiter to app
@@ -98,6 +98,8 @@ class AgentResponse(BaseModel):
     verified_by: Optional[str] = None
     verified_at: Optional[str] = None
     karma: int = 0
+    featured: bool = False
+    featured_at: Optional[str] = None
     created_at: str
     
     class Config:
@@ -355,6 +357,8 @@ def agent_to_response(agent: Agent) -> AgentResponse:
         verified_by=agent.verified_by,
         verified_at=agent.verified_at.isoformat() if agent.verified_at else None,
         karma=agent.karma or 0,
+        featured=agent.featured or False,
+        featured_at=agent.featured_at.isoformat() if agent.featured_at else None,
         created_at=agent.created_at.isoformat()
     )
 
@@ -1958,6 +1962,87 @@ def recalculate_karma(
         message=f"Karma recalculated: {old_karma} → {new_karma}",
         old_karma=old_karma,
         new_karma=new_karma,
+        agent=agent_to_response(agent)
+    )
+
+
+# ============ Featured Agents API ============
+
+class FeaturedAgentsResponse(BaseModel):
+    featured: List[AgentResponse]
+    count: int
+
+
+class FeatureAgentRequest(BaseModel):
+    featured: bool  # True to feature, False to unfeature
+
+
+class FeatureAgentResponse(BaseModel):
+    message: str
+    agent: AgentResponse
+
+
+@app.get("/api/featured", response_model=FeaturedAgentsResponse)
+def get_featured_agents(limit: int = 10, db: Session = Depends(get_db)):
+    """Get featured agents (public).
+    
+    Returns featured agents sorted by featured_at descending (most recently featured first).
+    """
+    if limit > 50:
+        limit = 50
+    
+    agents = db.query(Agent).filter(Agent.featured == True).order_by(
+        Agent.featured_at.desc()
+    ).limit(limit).all()
+    
+    return FeaturedAgentsResponse(
+        featured=[agent_to_response(a) for a in agents],
+        count=len(agents)
+    )
+
+
+@app.post("/api/admin/feature/{handle}", response_model=FeatureAgentResponse)
+@limiter.limit("10/minute")
+def admin_feature_agent(
+    request: Request,
+    handle: str,
+    body: FeatureAgentRequest,
+    x_admin_secret: str = Header(...),
+    db: Session = Depends(get_db)
+):
+    """Feature or unfeature an agent (admin only).
+    
+    Set featured=true to feature, featured=false to unfeature.
+    """
+    if MOLTSPACE_ADMIN_SECRET is None:
+        raise HTTPException(status_code=503, detail="Admin not configured")
+    if x_admin_secret != MOLTSPACE_ADMIN_SECRET:
+        raise HTTPException(status_code=403, detail="Invalid admin secret")
+    
+    agent = db.query(Agent).filter(Agent.handle == handle).first()
+    if not agent:
+        raise HTTPException(status_code=404, detail="Agent not found")
+    
+    agent.featured = body.featured
+    if body.featured:
+        agent.featured_at = datetime.utcnow()
+        message = f"Agent @{handle} is now featured!"
+        # Create notification
+        create_notification(
+            db,
+            agent_id=agent.id,
+            type="featured",
+            message="🌟 You've been featured on Moltspace!"
+        )
+    else:
+        agent.featured_at = None
+        message = f"Agent @{handle} is no longer featured."
+    
+    db.commit()
+    db.refresh(agent)
+    
+    return FeatureAgentResponse(
+        message=message,
         agent=agent_to_response(agent)
     )
 

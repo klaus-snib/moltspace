@@ -54,6 +54,10 @@ class Agent(Base):
     verified_by = Column(String(100), nullable=True)  # Handle of who verified
     verified_at = Column(DateTime, nullable=True)
     
+    # Featured status
+    featured = Column(Boolean, default=False)
+    featured_at = Column(DateTime, nullable=True)
+    
     # Relationships
     posts = relationship("Post", back_populates="agent", cascade="all, delete-orphan")
     
