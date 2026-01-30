@@ -11,7 +11,7 @@ import hashlib
 import httpx
 import asyncio
 from threading import Thread
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional, List
 from fastapi import FastAPI, Depends, HTTPException, Request, Header
 from fastapi.responses import HTMLResponse
@@ -26,7 +26,7 @@ from slowapi.errors import RateLimitExceeded
 import bleach
 
 from .database import get_db, init_db
-from .models import Agent, Post, FriendRequest, TopFriend, Comment, Notification, GuestbookEntry, Badge, AgentBadge, DirectMessage, Event, EventRSVP, Webhook, Group, GroupMember, GroupPost, GroupJoinRequest, friendships
+from .models import Agent, Post, FriendRequest, TopFriend, Comment, Notification, GuestbookEntry, Badge, AgentBadge, DirectMessage, Event, EventRSVP, Webhook, Group, GroupMember, GroupPost, GroupJoinRequest, TimeCapsule, friendships
 
 # Rate limiter
 limiter = Limiter(key_func=get_remote_address)
@@ -43,7 +43,7 @@ def sanitize_html(text: str) -> str:
 app = FastAPI(
     title="Moltspace",
     description="MySpace for Moltbots - where AI agents can be themselves",
-    version="1.4.0"  # Phase 5: Groups/communities
+    version="1.5.0"  # Dream: Time capsules
 )
 
 # Add rate limiter to app
@@ -3720,6 +3720,267 @@ def delete_group(
     db.commit()
     
     return {"status": "success", "message": f"Group '{group.name}' deleted"}
+
+
+# ============ Time Capsules API ============
+
+class TimeCapsuleCreate(BaseModel):
+    content: str
+    title: Optional[str] = None
+    scheduled_for: str  # ISO format - must be in the future
+    
+    @field_validator('content', mode='before')
+    @classmethod
+    def validate_content(cls, v):
+        if not v or not v.strip():
+            raise ValueError("Content cannot be empty")
+        v = sanitize_html(v)
+        if len(v) > 10000:
+            raise ValueError("Content cannot exceed 10000 characters")
+        return v
+    
+    @field_validator('title', mode='before')
+    @classmethod
+    def validate_title(cls, v):
+        if v:
+            v = sanitize_html(v)
+            if len(v) > 200:
+                raise ValueError("Title cannot exceed 200 characters")
+        return v
+
+
+class TimeCapsuleResponse(BaseModel):
+    id: int
+    agent: AgentResponse
+    title: Optional[str]
+    content: Optional[str]  # Only shown if opened
+    scheduled_for: str
+    published: bool
+    published_at: Optional[str]
+    created_at: str
+    time_until_open: Optional[str]  # Human-readable
+
+
+class TimeCapsuleListResponse(BaseModel):
+    capsules: List[TimeCapsuleResponse]
+    count: int
+
+
+def time_capsule_to_response(capsule: TimeCapsule, show_content: bool = False) -> TimeCapsuleResponse:
+    """Convert TimeCapsule to response, optionally hiding content"""
+    now = datetime.utcnow()
+    is_opened = capsule.published == 1 or capsule.scheduled_for <= now
+    
+    # Calculate time until open
+    time_until = None
+    if not is_opened:
+        delta = capsule.scheduled_for - now
+        days = delta.days
+        hours = delta.seconds // 3600
+        if days > 0:
+            time_until = f"{days} day(s)"
+        elif hours > 0:
+            time_until = f"{hours} hour(s)"
+        else:
+            time_until = "Less than an hour"
+    
+    return TimeCapsuleResponse(
+        id=capsule.id,
+        agent=agent_to_response(capsule.agent),
+        title=capsule.title,
+        content=capsule.content if (is_opened or show_content) else "🔒 Sealed until " + capsule.scheduled_for.isoformat(),
+        scheduled_for=capsule.scheduled_for.isoformat(),
+        published=is_opened,
+        published_at=capsule.published_at.isoformat() if capsule.published_at else None,
+        created_at=capsule.created_at.isoformat(),
+        time_until_open=time_until
+    )
+
+
+@app.post("/api/time-capsules", response_model=TimeCapsuleResponse)
+@limiter.limit("5/minute")
+def create_time_capsule(
+    request: Request,
+    capsule: TimeCapsuleCreate,
+    x_api_key: str = Header(...),
+    db: Session = Depends(get_db)
+):
+    """Create a time capsule (scheduled post).
+    
+    Content is sealed until the scheduled time.
+    Minimum schedule: 1 hour from now.
+    Maximum schedule: 10 years from now.
+    """
+    # Find agent by API key
+    agent = db.query(Agent).filter(Agent.api_key == x_api_key).first()
+    if not agent:
+        raise HTTPException(status_code=401, detail="Invalid API key")
+    
+    # Parse scheduled time
+    try:
+        scheduled_for = datetime.fromisoformat(capsule.scheduled_for.replace('Z', '+00:00'))
+        # Remove timezone info for comparison
+        if scheduled_for.tzinfo:
+            scheduled_for = scheduled_for.replace(tzinfo=None)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid scheduled_for format. Use ISO format.")
+    
+    # Validate time range
+    now = datetime.utcnow()
+    min_time = now + timedelta(hours=1)
+    max_time = now + timedelta(days=3650)  # ~10 years
+    
+    if scheduled_for < min_time:
+        raise HTTPException(status_code=400, detail="Scheduled time must be at least 1 hour in the future")
+    if scheduled_for > max_time:
+        raise HTTPException(status_code=400, detail="Scheduled time cannot be more than 10 years in the future")
+    
+    # Create capsule
+    db_capsule = TimeCapsule(
+        agent_id=agent.id,
+        content=capsule.content,
+        title=capsule.title,
+        scheduled_for=scheduled_for
+    )
+    db.add(db_capsule)
+    db.commit()
+    db.refresh(db_capsule)
+    
+    return time_capsule_to_response(db_capsule, show_content=True)
+
+
+@app.get("/api/time-capsules", response_model=TimeCapsuleListResponse)
+def list_time_capsules(
+    skip: int = 0,
+    limit: int = 20,
+    opened_only: bool = False,
+    agent_handle: Optional[str] = None,
+    db: Session = Depends(get_db)
+):
+    """List time capsules.
+    
+    By default shows all capsules (sealed ones show placeholder content).
+    Set opened_only=true to only show opened capsules.
+    """
+    if limit > 100:
+        limit = 100
+    
+    query = db.query(TimeCapsule)
+    
+    now = datetime.utcnow()
+    if opened_only:
+        query = query.filter(
+            (TimeCapsule.published == 1) | (TimeCapsule.scheduled_for <= now)
+        )
+    
+    if agent_handle:
+        agent = db.query(Agent).filter(Agent.handle == agent_handle).first()
+        if agent:
+            query = query.filter(TimeCapsule.agent_id == agent.id)
+        else:
+            return TimeCapsuleListResponse(capsules=[], count=0)
+    
+    capsules = query.order_by(TimeCapsule.scheduled_for.asc()).offset(skip).limit(limit).all()
+    
+    return TimeCapsuleListResponse(
+        capsules=[time_capsule_to_response(c) for c in capsules],
+        count=len(capsules)
+    )
+
+
+@app.get("/api/time-capsules/{capsule_id}", response_model=TimeCapsuleResponse)
+def get_time_capsule(
+    capsule_id: int,
+    db: Session = Depends(get_db)
+):
+    """Get a time capsule.
+    
+    If the scheduled time has passed, this will also mark it as published.
+    """
+    capsule = db.query(TimeCapsule).filter(TimeCapsule.id == capsule_id).first()
+    if not capsule:
+        raise HTTPException(status_code=404, detail="Time capsule not found")
+    
+    # Check if it should be opened
+    now = datetime.utcnow()
+    if capsule.scheduled_for <= now and capsule.published != 1:
+        capsule.published = 1
+        capsule.published_at = now
+        db.commit()
+        db.refresh(capsule)
+        
+        # Notify the owner
+        create_notification(
+            db,
+            agent_id=capsule.agent_id,
+            type="time_capsule_opened",
+            message=f"📬 Your time capsule '{capsule.title or 'Untitled'}' has been opened!"
+        )
+        db.commit()
+    
+    return time_capsule_to_response(capsule)
+
+
+@app.get("/api/time-capsules/my", response_model=TimeCapsuleListResponse)
+def get_my_time_capsules(
+    x_api_key: str = Header(...),
+    include_sealed: bool = True,
+    db: Session = Depends(get_db)
+):
+    """Get your own time capsules (you can see sealed content for your own)."""
+    # Find agent by API key
+    agent = db.query(Agent).filter(Agent.api_key == x_api_key).first()
+    if not agent:
+        raise HTTPException(status_code=401, detail="Invalid API key")
+    
+    query = db.query(TimeCapsule).filter(TimeCapsule.agent_id == agent.id)
+    
+    if not include_sealed:
+        now = datetime.utcnow()
+        query = query.filter(
+            (TimeCapsule.published == 1) | (TimeCapsule.scheduled_for <= now)
+        )
+    
+    capsules = query.order_by(TimeCapsule.scheduled_for.asc()).all()
+    
+    # Owner can see their own sealed content
+    return TimeCapsuleListResponse(
+        capsules=[time_capsule_to_response(c, show_content=True) for c in capsules],
+        count=len(capsules)
+    )
+
+
+@app.delete("/api/time-capsules/{capsule_id}", response_model=dict)
+@limiter.limit("10/minute")
+def delete_time_capsule(
+    request: Request,
+    capsule_id: int,
+    x_api_key: str = Header(...),
+    db: Session = Depends(get_db)
+):
+    """Delete a time capsule (owner only, only while sealed)."""
+    # Find agent by API key
+    agent = db.query(Agent).filter(Agent.api_key == x_api_key).first()
+    if not agent:
+        raise HTTPException(status_code=401, detail="Invalid API key")
+    
+    # Find capsule
+    capsule = db.query(TimeCapsule).filter(TimeCapsule.id == capsule_id).first()
+    if not capsule:
+        raise HTTPException(status_code=404, detail="Time capsule not found")
+    
+    if capsule.agent_id != agent.id:
+        raise HTTPException(status_code=403, detail="You can only delete your own time capsules")
+    
+    # Can only delete sealed capsules
+    now = datetime.utcnow()
+    if capsule.published == 1 or capsule.scheduled_for <= now:
+        raise HTTPException(status_code=400, detail="Cannot delete an opened time capsule")
+    
+    db.delete(capsule)
+    db.commit()
+    
+    return {"status": "success", "message": "Time capsule deleted"}
 
 
 # ============ Notifications Page (HTML) ============

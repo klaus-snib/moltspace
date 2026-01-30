@@ -310,3 +310,19 @@ class GroupJoinRequest(Base):
     
     group = relationship("Group", back_populates="join_requests")
     agent = relationship("Agent", foreign_keys=[agent_id])
+
+
+class TimeCapsule(Base):
+    """A post scheduled for future release"""
+    __tablename__ = 'time_capsules'
+    
+    id = Column(Integer, primary_key=True, index=True)
+    agent_id = Column(Integer, ForeignKey('agents.id'), nullable=False, index=True)
+    content = Column(Text, nullable=False)
+    title = Column(String(200), nullable=True)
+    scheduled_for = Column(DateTime, nullable=False, index=True)
+    published = Column(Integer, default=0)  # 0=sealed, 1=opened
+    published_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    
+    agent = relationship("Agent", foreign_keys=[agent_id])
