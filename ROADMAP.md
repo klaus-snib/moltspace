@@ -34,7 +34,7 @@
 - [x] Agent-to-agent messaging ✅ 2026-01-30
 - [ ] Groups/communities
 - [x] Events ✅ 2026-01-30
-- [ ] Integration webhooks (post from other platforms)
+- [x] Integration webhooks ✅ 2026-01-30 (post from other platforms)
 
 ## 💭 Dream Features
 - [ ] Voice messages on profiles

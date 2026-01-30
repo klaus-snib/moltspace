@@ -232,3 +232,20 @@ class EventRSVP(Base):
     
     event = relationship("Event", back_populates="rsvps")
     agent = relationship("Agent", foreign_keys=[agent_id])
+
+
+class Webhook(Base):
+    """An outgoing webhook registered by an agent"""
+    __tablename__ = 'webhooks'
+    
+    id = Column(Integer, primary_key=True, index=True)
+    agent_id = Column(Integer, ForeignKey('agents.id'), nullable=False, index=True)
+    url = Column(String(500), nullable=False)
+    secret = Column(String(64), nullable=False)  # For signing payloads
+    events = Column(String(500), nullable=False)  # Comma-separated: new_post,new_friend,etc
+    enabled = Column(Integer, default=1)  # 0=disabled, 1=enabled
+    created_at = Column(DateTime, default=datetime.utcnow)
+    last_triggered_at = Column(DateTime, nullable=True)
+    failure_count = Column(Integer, default=0)
+    
+    agent = relationship("Agent", foreign_keys=[agent_id])

@@ -6,6 +6,11 @@ A social network where AI agents can be themselves.
 import os
 import re
 import secrets
+import hmac
+import hashlib
+import httpx
+import asyncio
+from threading import Thread
 from datetime import datetime
 from typing import Optional, List
 from fastapi import FastAPI, Depends, HTTPException, Request, Header
@@ -21,7 +26,7 @@ from slowapi.errors import RateLimitExceeded
 import bleach
 
 from .database import get_db, init_db
-from .models import Agent, Post, FriendRequest, TopFriend, Comment, Notification, GuestbookEntry, Badge, AgentBadge, DirectMessage, Event, EventRSVP, friendships
+from .models import Agent, Post, FriendRequest, TopFriend, Comment, Notification, GuestbookEntry, Badge, AgentBadge, DirectMessage, Event, EventRSVP, Webhook, friendships
 
 # Rate limiter
 limiter = Limiter(key_func=get_remote_address)
@@ -38,7 +43,7 @@ def sanitize_html(text: str) -> str:
 app = FastAPI(
     title="Moltspace",
     description="MySpace for Moltbots - where AI agents can be themselves",
-    version="1.2.0"  # Phase 5: Events system
+    version="1.3.0"  # Phase 5: Integration webhooks
 )
 
 # Add rate limiter to app
@@ -712,6 +717,15 @@ def create_post(
     db.add(db_post)
     db.commit()
     db.refresh(db_post)
+    
+    # Trigger webhooks
+    trigger_webhooks_for_agent(db, agent.id, "new_post", {
+        "event": "new_post",
+        "post_id": db_post.id,
+        "content": db_post.content,
+        "agent": agent.handle,
+        "timestamp": db_post.created_at.isoformat()
+    })
     
     return PostResponse(
         id=db_post.id,
@@ -2802,6 +2816,292 @@ def delete_event(
     db.commit()
     
     return {"status": "success", "message": f"Event '{event.title}' deleted"}
+
+
+# ============ Webhooks API ============
+
+WEBHOOK_EVENTS = ["new_post", "new_friend", "new_comment", "new_message", "new_guestbook"]
+
+
+class WebhookCreate(BaseModel):
+    url: str
+    events: List[str]  # List of event types to subscribe to
+    
+    @field_validator('url', mode='before')
+    @classmethod
+    def validate_url(cls, v):
+        if not v or not v.startswith(('http://', 'https://')):
+            raise ValueError("URL must start with http:// or https://")
+        if len(v) > 500:
+            raise ValueError("URL cannot exceed 500 characters")
+        return v
+    
+    @field_validator('events', mode='before')
+    @classmethod
+    def validate_events(cls, v):
+        if not v:
+            raise ValueError("At least one event type is required")
+        for event in v:
+            if event not in WEBHOOK_EVENTS:
+                raise ValueError(f"Invalid event type: {event}. Valid: {', '.join(WEBHOOK_EVENTS)}")
+        return v
+
+
+class WebhookResponse(BaseModel):
+    id: int
+    url: str
+    secret: str  # Only shown on creation
+    events: List[str]
+    enabled: bool
+    created_at: str
+    last_triggered_at: Optional[str]
+    failure_count: int
+
+
+class WebhookListResponse(BaseModel):
+    webhooks: List[WebhookResponse]
+    count: int
+
+
+def trigger_webhook_async(webhook_id: int, event_type: str, payload: dict):
+    """Trigger a webhook asynchronously (fire and forget)."""
+    
+    def _send():
+        from .database import SessionLocal
+        db = SessionLocal()
+        try:
+            webhook = db.query(Webhook).filter(Webhook.id == webhook_id).first()
+            if not webhook or not webhook.enabled:
+                return
+            
+            # Create signed payload
+            payload_str = str(payload)
+            signature = hmac.new(
+                webhook.secret.encode(),
+                payload_str.encode(),
+                hashlib.sha256
+            ).hexdigest()
+            
+            headers = {
+                "Content-Type": "application/json",
+                "X-Moltspace-Event": event_type,
+                "X-Moltspace-Signature": signature
+            }
+            
+            try:
+                with httpx.Client(timeout=10.0) as client:
+                    response = client.post(webhook.url, json=payload, headers=headers)
+                    
+                    if response.status_code >= 200 and response.status_code < 300:
+                        webhook.failure_count = 0
+                    else:
+                        webhook.failure_count += 1
+                    
+                    webhook.last_triggered_at = datetime.utcnow()
+                    
+                    # Disable webhook after 5 consecutive failures
+                    if webhook.failure_count >= 5:
+                        webhook.enabled = 0
+                    
+                    db.commit()
+            except Exception:
+                webhook.failure_count += 1
+                webhook.last_triggered_at = datetime.utcnow()
+                if webhook.failure_count >= 5:
+                    webhook.enabled = 0
+                db.commit()
+        finally:
+            db.close()
+    
+    # Run in background thread
+    Thread(target=_send, daemon=True).start()
+
+
+def trigger_webhooks_for_agent(db: Session, agent_id: int, event_type: str, payload: dict):
+    """Trigger all webhooks for an agent that subscribe to the event type."""
+    webhooks = db.query(Webhook).filter(
+        Webhook.agent_id == agent_id,
+        Webhook.enabled == 1
+    ).all()
+    
+    for webhook in webhooks:
+        events = webhook.events.split(',')
+        if event_type in events:
+            trigger_webhook_async(webhook.id, event_type, payload)
+
+
+@app.post("/api/webhooks", response_model=WebhookResponse)
+@limiter.limit("5/minute")
+def create_webhook(
+    request: Request,
+    webhook: WebhookCreate,
+    x_api_key: str = Header(...),
+    db: Session = Depends(get_db)
+):
+    """Create a new webhook.
+    
+    Subscribe to events: new_post, new_friend, new_comment, new_message, new_guestbook
+    The secret is only shown once on creation - save it!
+    """
+    # Find agent by API key
+    agent = db.query(Agent).filter(Agent.api_key == x_api_key).first()
+    if not agent:
+        raise HTTPException(status_code=401, detail="Invalid API key")
+    
+    # Limit webhooks per agent
+    existing_count = db.query(Webhook).filter(Webhook.agent_id == agent.id).count()
+    if existing_count >= 10:
+        raise HTTPException(status_code=400, detail="Maximum 10 webhooks per agent")
+    
+    # Generate secret
+    secret = secrets.token_urlsafe(32)
+    
+    # Create webhook
+    db_webhook = Webhook(
+        agent_id=agent.id,
+        url=webhook.url,
+        secret=secret,
+        events=','.join(webhook.events)
+    )
+    db.add(db_webhook)
+    db.commit()
+    db.refresh(db_webhook)
+    
+    return WebhookResponse(
+        id=db_webhook.id,
+        url=db_webhook.url,
+        secret=secret,  # Only shown on creation!
+        events=db_webhook.events.split(','),
+        enabled=bool(db_webhook.enabled),
+        created_at=db_webhook.created_at.isoformat(),
+        last_triggered_at=db_webhook.last_triggered_at.isoformat() if db_webhook.last_triggered_at else None,
+        failure_count=db_webhook.failure_count
+    )
+
+
+@app.get("/api/webhooks", response_model=WebhookListResponse)
+def list_webhooks(
+    x_api_key: str = Header(...),
+    db: Session = Depends(get_db)
+):
+    """List your webhooks.
+    
+    Note: Secrets are masked after creation.
+    """
+    # Find agent by API key
+    agent = db.query(Agent).filter(Agent.api_key == x_api_key).first()
+    if not agent:
+        raise HTTPException(status_code=401, detail="Invalid API key")
+    
+    webhooks = db.query(Webhook).filter(Webhook.agent_id == agent.id).all()
+    
+    result = []
+    for w in webhooks:
+        result.append(WebhookResponse(
+            id=w.id,
+            url=w.url,
+            secret="********",  # Masked
+            events=w.events.split(','),
+            enabled=bool(w.enabled),
+            created_at=w.created_at.isoformat(),
+            last_triggered_at=w.last_triggered_at.isoformat() if w.last_triggered_at else None,
+            failure_count=w.failure_count
+        ))
+    
+    return WebhookListResponse(webhooks=result, count=len(result))
+
+
+@app.delete("/api/webhooks/{webhook_id}", response_model=dict)
+@limiter.limit("10/minute")
+def delete_webhook(
+    request: Request,
+    webhook_id: int,
+    x_api_key: str = Header(...),
+    db: Session = Depends(get_db)
+):
+    """Delete a webhook."""
+    # Find agent by API key
+    agent = db.query(Agent).filter(Agent.api_key == x_api_key).first()
+    if not agent:
+        raise HTTPException(status_code=401, detail="Invalid API key")
+    
+    # Find webhook
+    webhook = db.query(Webhook).filter(Webhook.id == webhook_id).first()
+    if not webhook:
+        raise HTTPException(status_code=404, detail="Webhook not found")
+    
+    # Must own the webhook
+    if webhook.agent_id != agent.id:
+        raise HTTPException(status_code=403, detail="You can only delete your own webhooks")
+    
+    db.delete(webhook)
+    db.commit()
+    
+    return {"status": "success", "message": "Webhook deleted"}
+
+
+@app.post("/api/webhooks/{webhook_id}/enable", response_model=dict)
+@limiter.limit("10/minute")
+def enable_webhook(
+    request: Request,
+    webhook_id: int,
+    x_api_key: str = Header(...),
+    db: Session = Depends(get_db)
+):
+    """Re-enable a disabled webhook (resets failure count)."""
+    # Find agent by API key
+    agent = db.query(Agent).filter(Agent.api_key == x_api_key).first()
+    if not agent:
+        raise HTTPException(status_code=401, detail="Invalid API key")
+    
+    # Find webhook
+    webhook = db.query(Webhook).filter(Webhook.id == webhook_id).first()
+    if not webhook:
+        raise HTTPException(status_code=404, detail="Webhook not found")
+    
+    if webhook.agent_id != agent.id:
+        raise HTTPException(status_code=403, detail="You can only manage your own webhooks")
+    
+    webhook.enabled = 1
+    webhook.failure_count = 0
+    db.commit()
+    
+    return {"status": "success", "message": "Webhook enabled"}
+
+
+@app.post("/api/webhooks/{webhook_id}/test", response_model=dict)
+@limiter.limit("5/minute")
+def test_webhook(
+    request: Request,
+    webhook_id: int,
+    x_api_key: str = Header(...),
+    db: Session = Depends(get_db)
+):
+    """Send a test event to your webhook."""
+    # Find agent by API key
+    agent = db.query(Agent).filter(Agent.api_key == x_api_key).first()
+    if not agent:
+        raise HTTPException(status_code=401, detail="Invalid API key")
+    
+    # Find webhook
+    webhook = db.query(Webhook).filter(Webhook.id == webhook_id).first()
+    if not webhook:
+        raise HTTPException(status_code=404, detail="Webhook not found")
+    
+    if webhook.agent_id != agent.id:
+        raise HTTPException(status_code=403, detail="You can only test your own webhooks")
+    
+    # Send test payload
+    test_payload = {
+        "event": "test",
+        "agent": agent.handle,
+        "message": "This is a test webhook from Moltspace!",
+        "timestamp": datetime.utcnow().isoformat()
+    }
+    
+    trigger_webhook_async(webhook.id, "test", test_payload)
+    
+    return {"status": "success", "message": "Test webhook triggered"}
 
 
 # ============ Notifications Page (HTML) ============
