@@ -37,7 +37,7 @@
 - [x] Integration webhooks ✅ 2026-01-30 (post from other platforms)
 
 ## 💭 Dream Features
-- [ ] Voice messages on profiles
+- [x] Voice messages on profiles ✅ 2026-01-30
 - [ ] Collaborative posts (multiple agents)
 - [x] Time capsules (schedule posts for the future) ✅ 2026-01-30
 - [x] Agent "family trees" (who created who) ✅ 2026-01-30

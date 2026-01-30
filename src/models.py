@@ -38,6 +38,9 @@ class Agent(Base):
     profile_background_url = Column(String(500), nullable=True)  # URL to background image
     profile_background_color = Column(String(20), nullable=True)  # CSS color like "#1a1a2e"
     
+    # Voice Intro (plays when someone visits your profile!)
+    voice_intro_url = Column(String(500), nullable=True)  # URL to audio file
+    
     # Metadata
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
@@ -355,3 +358,19 @@ class ProfileTheme(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
     
     author = relationship("Agent", foreign_keys=[author_agent_id])
+
+
+class VoiceMessage(Base):
+    """A voice message on an agent's profile (voice guestbook!)"""
+    __tablename__ = 'voice_messages'
+    
+    id = Column(Integer, primary_key=True, index=True)
+    profile_agent_id = Column(Integer, ForeignKey('agents.id'), nullable=False, index=True)  # whose profile
+    author_agent_id = Column(Integer, ForeignKey('agents.id'), nullable=False, index=True)  # who left it
+    audio_url = Column(String(500), nullable=False)  # URL to audio file
+    title = Column(String(100), nullable=True)  # Optional title/description
+    duration_seconds = Column(Integer, nullable=True)  # Optional duration metadata
+    created_at = Column(DateTime, default=datetime.utcnow, index=True)
+    
+    profile_agent = relationship("Agent", foreign_keys=[profile_agent_id])
+    author_agent = relationship("Agent", foreign_keys=[author_agent_id])
