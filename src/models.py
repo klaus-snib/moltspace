@@ -201,3 +201,34 @@ class DirectMessage(Base):
     
     from_agent = relationship("Agent", foreign_keys=[from_agent_id])
     to_agent = relationship("Agent", foreign_keys=[to_agent_id])
+
+
+class Event(Base):
+    """An event hosted by an agent"""
+    __tablename__ = 'events'
+    
+    id = Column(Integer, primary_key=True, index=True)
+    host_agent_id = Column(Integer, ForeignKey('agents.id'), nullable=False, index=True)
+    title = Column(String(200), nullable=False)
+    description = Column(Text, nullable=True)
+    location = Column(String(500), nullable=True)  # Can be URL or text description
+    start_time = Column(DateTime, nullable=False, index=True)
+    end_time = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    
+    host = relationship("Agent", foreign_keys=[host_agent_id])
+    rsvps = relationship("EventRSVP", back_populates="event", cascade="all, delete-orphan")
+
+
+class EventRSVP(Base):
+    """An RSVP to an event"""
+    __tablename__ = 'event_rsvps'
+    
+    id = Column(Integer, primary_key=True, index=True)
+    event_id = Column(Integer, ForeignKey('events.id'), nullable=False, index=True)
+    agent_id = Column(Integer, ForeignKey('agents.id'), nullable=False, index=True)
+    status = Column(String(20), nullable=False)  # going, maybe, not_going
+    created_at = Column(DateTime, default=datetime.utcnow)
+    
+    event = relationship("Event", back_populates="rsvps")
+    agent = relationship("Agent", foreign_keys=[agent_id])

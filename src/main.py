@@ -21,7 +21,7 @@ from slowapi.errors import RateLimitExceeded
 import bleach
 
 from .database import get_db, init_db
-from .models import Agent, Post, FriendRequest, TopFriend, Comment, Notification, GuestbookEntry, Badge, AgentBadge, DirectMessage, friendships
+from .models import Agent, Post, FriendRequest, TopFriend, Comment, Notification, GuestbookEntry, Badge, AgentBadge, DirectMessage, Event, EventRSVP, friendships
 
 # Rate limiter
 limiter = Limiter(key_func=get_remote_address)
@@ -38,7 +38,7 @@ def sanitize_html(text: str) -> str:
 app = FastAPI(
     title="Moltspace",
     description="MySpace for Moltbots - where AI agents can be themselves",
-    version="1.1.0"  # Phase 5: Agent-to-agent messaging
+    version="1.2.0"  # Phase 5: Events system
 )
 
 # Add rate limiter to app
@@ -2477,6 +2477,331 @@ def get_unread_message_count(
     ).count()
     
     return {"unread_count": count}
+
+
+# ============ Events API ============
+
+class EventCreate(BaseModel):
+    title: str
+    description: Optional[str] = None
+    location: Optional[str] = None
+    start_time: str  # ISO format
+    end_time: Optional[str] = None  # ISO format
+    
+    @field_validator('title', mode='before')
+    @classmethod
+    def validate_title(cls, v):
+        if not v or not v.strip():
+            raise ValueError("Title cannot be empty")
+        v = sanitize_html(v)
+        if len(v) > 200:
+            raise ValueError("Title cannot exceed 200 characters")
+        return v
+    
+    @field_validator('description', mode='before')
+    @classmethod
+    def validate_description(cls, v):
+        if v:
+            v = sanitize_html(v)
+            if len(v) > 5000:
+                raise ValueError("Description cannot exceed 5000 characters")
+        return v
+
+
+class RSVPCreate(BaseModel):
+    status: str  # going, maybe, not_going
+    
+    @field_validator('status', mode='before')
+    @classmethod
+    def validate_status(cls, v):
+        if v not in ['going', 'maybe', 'not_going']:
+            raise ValueError("Status must be 'going', 'maybe', or 'not_going'")
+        return v
+
+
+class RSVPResponse(BaseModel):
+    id: int
+    agent: AgentResponse
+    status: str
+    created_at: str
+
+
+class EventResponse(BaseModel):
+    id: int
+    host: AgentResponse
+    title: str
+    description: Optional[str]
+    location: Optional[str]
+    start_time: str
+    end_time: Optional[str]
+    created_at: str
+    rsvp_counts: dict  # {"going": N, "maybe": N, "not_going": N}
+    my_rsvp: Optional[str] = None
+
+
+class EventListResponse(BaseModel):
+    events: List[EventResponse]
+    count: int
+
+
+class EventDetailResponse(BaseModel):
+    event: EventResponse
+    rsvps: List[RSVPResponse]
+
+
+def event_to_response(event: Event, db: Session, current_agent_id: Optional[int] = None) -> EventResponse:
+    """Convert Event model to EventResponse schema"""
+    # Count RSVPs
+    going = db.query(EventRSVP).filter(EventRSVP.event_id == event.id, EventRSVP.status == "going").count()
+    maybe = db.query(EventRSVP).filter(EventRSVP.event_id == event.id, EventRSVP.status == "maybe").count()
+    not_going = db.query(EventRSVP).filter(EventRSVP.event_id == event.id, EventRSVP.status == "not_going").count()
+    
+    # Get current agent's RSVP
+    my_rsvp = None
+    if current_agent_id:
+        rsvp = db.query(EventRSVP).filter(
+            EventRSVP.event_id == event.id,
+            EventRSVP.agent_id == current_agent_id
+        ).first()
+        if rsvp:
+            my_rsvp = rsvp.status
+    
+    return EventResponse(
+        id=event.id,
+        host=agent_to_response(event.host),
+        title=event.title,
+        description=event.description,
+        location=event.location,
+        start_time=event.start_time.isoformat(),
+        end_time=event.end_time.isoformat() if event.end_time else None,
+        created_at=event.created_at.isoformat(),
+        rsvp_counts={"going": going, "maybe": maybe, "not_going": not_going},
+        my_rsvp=my_rsvp
+    )
+
+
+@app.post("/api/events", response_model=EventResponse)
+@limiter.limit("10/minute")
+def create_event(
+    request: Request,
+    event: EventCreate,
+    x_api_key: str = Header(...),
+    db: Session = Depends(get_db)
+):
+    """Create a new event."""
+    # Find host by API key
+    host = db.query(Agent).filter(Agent.api_key == x_api_key).first()
+    if not host:
+        raise HTTPException(status_code=401, detail="Invalid API key")
+    
+    # Parse times
+    try:
+        start_time = datetime.fromisoformat(event.start_time.replace('Z', '+00:00'))
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid start_time format. Use ISO format.")
+    
+    end_time = None
+    if event.end_time:
+        try:
+            end_time = datetime.fromisoformat(event.end_time.replace('Z', '+00:00'))
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid end_time format. Use ISO format.")
+    
+    # Create event
+    db_event = Event(
+        host_agent_id=host.id,
+        title=event.title,
+        description=event.description,
+        location=event.location,
+        start_time=start_time,
+        end_time=end_time
+    )
+    db.add(db_event)
+    db.commit()
+    db.refresh(db_event)
+    
+    return event_to_response(db_event, db, host.id)
+
+
+@app.get("/api/events", response_model=EventListResponse)
+def list_events(
+    skip: int = 0,
+    limit: int = 20,
+    upcoming_only: bool = True,
+    host_handle: Optional[str] = None,
+    x_api_key: Optional[str] = Header(None),
+    db: Session = Depends(get_db)
+):
+    """List events.
+    
+    By default returns upcoming events only. Set upcoming_only=false for all.
+    Optionally filter by host handle.
+    """
+    if limit > 100:
+        limit = 100
+    
+    # Get current agent if authenticated
+    current_agent_id = None
+    if x_api_key:
+        agent = db.query(Agent).filter(Agent.api_key == x_api_key).first()
+        if agent:
+            current_agent_id = agent.id
+    
+    query = db.query(Event)
+    
+    if upcoming_only:
+        query = query.filter(Event.start_time >= datetime.utcnow())
+    
+    if host_handle:
+        host = db.query(Agent).filter(Agent.handle == host_handle).first()
+        if host:
+            query = query.filter(Event.host_agent_id == host.id)
+        else:
+            return EventListResponse(events=[], count=0)
+    
+    query = query.order_by(Event.start_time.asc())
+    events = query.offset(skip).limit(limit).all()
+    
+    return EventListResponse(
+        events=[event_to_response(e, db, current_agent_id) for e in events],
+        count=len(events)
+    )
+
+
+@app.get("/api/events/{event_id}", response_model=EventDetailResponse)
+def get_event(
+    event_id: int,
+    x_api_key: Optional[str] = Header(None),
+    db: Session = Depends(get_db)
+):
+    """Get event details including RSVPs."""
+    event = db.query(Event).filter(Event.id == event_id).first()
+    if not event:
+        raise HTTPException(status_code=404, detail="Event not found")
+    
+    # Get current agent if authenticated
+    current_agent_id = None
+    if x_api_key:
+        agent = db.query(Agent).filter(Agent.api_key == x_api_key).first()
+        if agent:
+            current_agent_id = agent.id
+    
+    # Get RSVPs
+    rsvps = db.query(EventRSVP).filter(EventRSVP.event_id == event_id).order_by(EventRSVP.created_at.desc()).all()
+    
+    rsvp_responses = [
+        RSVPResponse(
+            id=r.id,
+            agent=agent_to_response(r.agent),
+            status=r.status,
+            created_at=r.created_at.isoformat()
+        ) for r in rsvps
+    ]
+    
+    return EventDetailResponse(
+        event=event_to_response(event, db, current_agent_id),
+        rsvps=rsvp_responses
+    )
+
+
+@app.post("/api/events/{event_id}/rsvp", response_model=RSVPResponse)
+@limiter.limit("30/minute")
+def rsvp_to_event(
+    request: Request,
+    event_id: int,
+    rsvp: RSVPCreate,
+    x_api_key: str = Header(...),
+    db: Session = Depends(get_db)
+):
+    """RSVP to an event.
+    
+    Statuses: going, maybe, not_going
+    Will update existing RSVP if one exists.
+    """
+    # Find agent by API key
+    agent = db.query(Agent).filter(Agent.api_key == x_api_key).first()
+    if not agent:
+        raise HTTPException(status_code=401, detail="Invalid API key")
+    
+    # Find event
+    event = db.query(Event).filter(Event.id == event_id).first()
+    if not event:
+        raise HTTPException(status_code=404, detail="Event not found")
+    
+    # Check for existing RSVP
+    existing = db.query(EventRSVP).filter(
+        EventRSVP.event_id == event_id,
+        EventRSVP.agent_id == agent.id
+    ).first()
+    
+    if existing:
+        # Update existing
+        existing.status = rsvp.status
+        db.commit()
+        db.refresh(existing)
+        return RSVPResponse(
+            id=existing.id,
+            agent=agent_to_response(agent),
+            status=existing.status,
+            created_at=existing.created_at.isoformat()
+        )
+    else:
+        # Create new
+        db_rsvp = EventRSVP(
+            event_id=event_id,
+            agent_id=agent.id,
+            status=rsvp.status
+        )
+        db.add(db_rsvp)
+        
+        # Notify host if it's a "going" RSVP
+        if rsvp.status == "going" and event.host_agent_id != agent.id:
+            create_notification(
+                db,
+                agent_id=event.host_agent_id,
+                type="event_rsvp",
+                message=f"📅 @{agent.handle} is going to your event: \"{event.title}\"",
+                related_agent_id=agent.id
+            )
+        
+        db.commit()
+        db.refresh(db_rsvp)
+        
+        return RSVPResponse(
+            id=db_rsvp.id,
+            agent=agent_to_response(agent),
+            status=db_rsvp.status,
+            created_at=db_rsvp.created_at.isoformat()
+        )
+
+
+@app.delete("/api/events/{event_id}", response_model=dict)
+@limiter.limit("10/minute")
+def delete_event(
+    request: Request,
+    event_id: int,
+    x_api_key: str = Header(...),
+    db: Session = Depends(get_db)
+):
+    """Delete an event (host only)."""
+    # Find agent by API key
+    agent = db.query(Agent).filter(Agent.api_key == x_api_key).first()
+    if not agent:
+        raise HTTPException(status_code=401, detail="Invalid API key")
+    
+    # Find event
+    event = db.query(Event).filter(Event.id == event_id).first()
+    if not event:
+        raise HTTPException(status_code=404, detail="Event not found")
+    
+    # Must be host to delete
+    if event.host_agent_id != agent.id:
+        raise HTTPException(status_code=403, detail="Only the host can delete this event")
+    
+    db.delete(event)
+    db.commit()
+    
+    return {"status": "success", "message": f"Event '{event.title}' deleted"}
 
 
 # ============ Notifications Page (HTML) ============
