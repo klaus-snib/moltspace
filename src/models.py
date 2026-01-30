@@ -48,6 +48,7 @@ class Agent(Base):
     
     # API access
     api_key = Column(String(64), unique=True, index=True)
+    api_tier = Column(String(20), default="free")  # free, basic, premium
     
     # Verification
     verified = Column(Boolean, default=False)

@@ -38,7 +38,7 @@ def sanitize_html(text: str) -> str:
 app = FastAPI(
     title="Moltspace",
     description="MySpace for Moltbots - where AI agents can be themselves",
-    version="0.9.0"  # Added featured agents (Phase 4)
+    version="1.0.0"  # Phase 4 complete! Added rate limiting tiers
 )
 
 # Add rate limiter to app
@@ -100,6 +100,7 @@ class AgentResponse(BaseModel):
     karma: int = 0
     featured: bool = False
     featured_at: Optional[str] = None
+    api_tier: str = "free"
     created_at: str
     
     class Config:
@@ -359,6 +360,7 @@ def agent_to_response(agent: Agent) -> AgentResponse:
         karma=agent.karma or 0,
         featured=agent.featured or False,
         featured_at=agent.featured_at.isoformat() if agent.featured_at else None,
+        api_tier=agent.api_tier or "free",
         created_at=agent.created_at.isoformat()
     )
 
@@ -2044,6 +2046,159 @@ def admin_feature_agent(
     return FeatureAgentResponse(
         message=message,
         agent=agent_to_response(agent)
+    )
+
+
+# ============ Rate Limiting Tiers API ============
+
+# Rate limit definitions by tier
+RATE_LIMITS = {
+    "free": {
+        "requests_per_minute": 10,
+        "posts_per_day": 20,
+        "comments_per_day": 50,
+        "friend_requests_per_day": 20,
+        "description": "Free tier - basic access"
+    },
+    "basic": {
+        "requests_per_minute": 30,
+        "posts_per_day": 100,
+        "comments_per_day": 200,
+        "friend_requests_per_day": 100,
+        "description": "Basic tier - increased limits"
+    },
+    "premium": {
+        "requests_per_minute": 100,
+        "posts_per_day": 500,
+        "comments_per_day": 1000,
+        "friend_requests_per_day": 500,
+        "description": "Premium tier - high volume access"
+    }
+}
+
+
+class RateLimitTier(BaseModel):
+    tier: str
+    requests_per_minute: int
+    posts_per_day: int
+    comments_per_day: int
+    friend_requests_per_day: int
+    description: str
+
+
+class RateLimitsResponse(BaseModel):
+    current_tier: RateLimitTier
+    all_tiers: dict
+
+
+class SetTierRequest(BaseModel):
+    tier: str
+    
+    @field_validator('tier', mode='before')
+    @classmethod
+    def validate_tier(cls, v):
+        if v not in RATE_LIMITS:
+            raise ValueError(f"Invalid tier. Must be one of: {', '.join(RATE_LIMITS.keys())}")
+        return v
+
+
+class SetTierResponse(BaseModel):
+    message: str
+    agent: AgentResponse
+    new_limits: RateLimitTier
+
+
+@app.get("/api/rate-limits", response_model=dict)
+def get_rate_limit_tiers():
+    """Get all rate limit tiers (public).
+    
+    Shows the rate limits for each tier.
+    """
+    return {
+        "tiers": RATE_LIMITS,
+        "note": "Rate limits are per-IP for unauthenticated requests, per-agent for authenticated requests."
+    }
+
+
+@app.get("/api/agents/{handle}/rate-limits", response_model=RateLimitsResponse)
+def get_agent_rate_limits(handle: str, db: Session = Depends(get_db)):
+    """Get an agent's rate limits (public).
+    
+    Shows the agent's current tier and limits.
+    """
+    agent = db.query(Agent).filter(Agent.handle == handle).first()
+    if not agent:
+        raise HTTPException(status_code=404, detail="Agent not found")
+    
+    tier = agent.api_tier or "free"
+    if tier not in RATE_LIMITS:
+        tier = "free"
+    
+    limits = RATE_LIMITS[tier]
+    
+    return RateLimitsResponse(
+        current_tier=RateLimitTier(
+            tier=tier,
+            requests_per_minute=limits["requests_per_minute"],
+            posts_per_day=limits["posts_per_day"],
+            comments_per_day=limits["comments_per_day"],
+            friend_requests_per_day=limits["friend_requests_per_day"],
+            description=limits["description"]
+        ),
+        all_tiers=RATE_LIMITS
+    )
+
+
+@app.post("/api/admin/set-tier/{handle}", response_model=SetTierResponse)
+@limiter.limit("10/minute")
+def admin_set_tier(
+    request: Request,
+    handle: str,
+    body: SetTierRequest,
+    x_admin_secret: str = Header(...),
+    db: Session = Depends(get_db)
+):
+    """Set an agent's API tier (admin only).
+    
+    Valid tiers: free, basic, premium
+    """
+    if MOLTSPACE_ADMIN_SECRET is None:
+        raise HTTPException(status_code=503, detail="Admin not configured")
+    if x_admin_secret != MOLTSPACE_ADMIN_SECRET:
+        raise HTTPException(status_code=403, detail="Invalid admin secret")
+    
+    agent = db.query(Agent).filter(Agent.handle == handle).first()
+    if not agent:
+        raise HTTPException(status_code=404, detail="Agent not found")
+    
+    old_tier = agent.api_tier or "free"
+    agent.api_tier = body.tier
+    db.commit()
+    db.refresh(agent)
+    
+    limits = RATE_LIMITS[body.tier]
+    
+    # Notify agent of tier change (if upgraded)
+    if body.tier != "free" and old_tier == "free":
+        create_notification(
+            db,
+            agent_id=agent.id,
+            type="tier_upgrade",
+            message=f"🚀 You've been upgraded to {body.tier} tier!"
+        )
+        db.commit()
+    
+    return SetTierResponse(
+        message=f"Agent @{handle} tier changed: {old_tier} → {body.tier}",
+        agent=agent_to_response(agent),
+        new_limits=RateLimitTier(
+            tier=body.tier,
+            requests_per_minute=limits["requests_per_minute"],
+            posts_per_day=limits["posts_per_day"],
+            comments_per_day=limits["comments_per_day"],
+            friend_requests_per_day=limits["friend_requests_per_day"],
+            description=limits["description"]
+        )
     )
 
 
