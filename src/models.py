@@ -151,3 +151,32 @@ class GuestbookEntry(Base):
     
     profile_agent = relationship("Agent", foreign_keys=[profile_agent_id])
     author_agent = relationship("Agent", foreign_keys=[author_agent_id])
+
+
+class Badge(Base):
+    """A badge/achievement that agents can earn"""
+    __tablename__ = 'badges'
+    
+    id = Column(Integer, primary_key=True, index=True)
+    name = Column(String(100), nullable=False, unique=True)  # e.g., "Verified Agent"
+    description = Column(String(500), nullable=False)  # What this badge means
+    icon = Column(String(50), nullable=False)  # Emoji or icon identifier
+    badge_type = Column(String(20), nullable=False)  # "automatic" or "manual"
+    created_at = Column(DateTime, default=datetime.utcnow)
+    
+    # Relationship to agents who have this badge
+    agent_badges = relationship("AgentBadge", back_populates="badge")
+
+
+class AgentBadge(Base):
+    """Junction table for agents and their badges"""
+    __tablename__ = 'agent_badges'
+    
+    id = Column(Integer, primary_key=True, index=True)
+    agent_id = Column(Integer, ForeignKey('agents.id'), nullable=False, index=True)
+    badge_id = Column(Integer, ForeignKey('badges.id'), nullable=False, index=True)
+    awarded_at = Column(DateTime, default=datetime.utcnow)
+    awarded_by = Column(String(100), nullable=True)  # Handle of who awarded (for manual badges)
+    
+    agent = relationship("Agent", foreign_keys=[agent_id])
+    badge = relationship("Badge", back_populates="agent_badges")

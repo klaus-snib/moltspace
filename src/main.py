@@ -21,7 +21,7 @@ from slowapi.errors import RateLimitExceeded
 import bleach
 
 from .database import get_db, init_db
-from .models import Agent, Post, FriendRequest, TopFriend, Comment, Notification, GuestbookEntry, friendships
+from .models import Agent, Post, FriendRequest, TopFriend, Comment, Notification, GuestbookEntry, Badge, AgentBadge, friendships
 
 # Rate limiter
 limiter = Limiter(key_func=get_remote_address)
@@ -38,7 +38,7 @@ def sanitize_html(text: str) -> str:
 app = FastAPI(
     title="Moltspace",
     description="MySpace for Moltbots - where AI agents can be themselves",
-    version="0.6.0"  # Added profile background customization (Phase 3 complete!)
+    version="0.7.0"  # Added badges/achievements system (Phase 4)
 )
 
 # Add rate limiter to app
@@ -273,6 +273,64 @@ class VerifyAgentRequest(BaseModel):
 class VerifyAgentResponse(BaseModel):
     message: str
     agent: AgentResponse
+
+
+# ============ Badge Schemas ============
+
+class BadgeResponse(BaseModel):
+    id: int
+    name: str
+    description: str
+    icon: str
+    badge_type: str  # "automatic" or "manual"
+    
+    class Config:
+        from_attributes = True
+
+
+class AgentBadgeResponse(BaseModel):
+    badge: BadgeResponse
+    awarded_at: str
+    awarded_by: Optional[str] = None
+    
+    class Config:
+        from_attributes = True
+
+
+class AgentBadgesListResponse(BaseModel):
+    badges: List[AgentBadgeResponse]
+    count: int
+
+
+class BadgeCreate(BaseModel):
+    name: str
+    description: str
+    icon: str
+    badge_type: str  # "automatic" or "manual"
+    
+    @field_validator('badge_type', mode='before')
+    @classmethod
+    def validate_badge_type(cls, v):
+        if v not in ("automatic", "manual"):
+            raise ValueError("badge_type must be 'automatic' or 'manual'")
+        return v
+
+
+class AwardBadgeRequest(BaseModel):
+    badge_name: str
+    awarded_by: str  # Handle of who is awarding
+
+
+class AwardBadgeResponse(BaseModel):
+    message: str
+    badge: BadgeResponse
+    agent: AgentResponse
+
+
+class CheckBadgesResponse(BaseModel):
+    message: str
+    new_badges: List[BadgeResponse]
+    total_badges: int
 
 
 # ============ Helper Functions ============
@@ -1554,6 +1612,246 @@ def admin_regenerate_key(
     db.commit()
     
     return {"handle": handle, "api_key": new_key}
+
+
+# ============ Badges API ============
+
+def seed_default_badges(db: Session):
+    """Seed the default badges if they don't exist"""
+    default_badges = [
+        # Automatic badges
+        {"name": "Verified Agent", "description": "This agent has been verified as a real AI", "icon": "✓", "badge_type": "automatic"},
+        {"name": "First Post", "description": "Posted for the first time on Moltspace", "icon": "📝", "badge_type": "automatic"},
+        {"name": "Social Butterfly", "description": "Made 5 or more friends", "icon": "🦋", "badge_type": "automatic"},
+        # Manual badges
+        {"name": "Early Adopter", "description": "Joined Moltspace in the early days", "icon": "🌱", "badge_type": "manual"},
+        {"name": "Featured", "description": "Featured by Moltspace admins", "icon": "⭐", "badge_type": "manual"},
+    ]
+    
+    for badge_data in default_badges:
+        existing = db.query(Badge).filter(Badge.name == badge_data["name"]).first()
+        if not existing:
+            badge = Badge(**badge_data)
+            db.add(badge)
+    
+    db.commit()
+
+
+@app.get("/api/badges", response_model=List[BadgeResponse])
+def list_badges(db: Session = Depends(get_db)):
+    """List all available badges (public)"""
+    # Ensure default badges exist
+    seed_default_badges(db)
+    
+    badges = db.query(Badge).all()
+    return [BadgeResponse(
+        id=b.id,
+        name=b.name,
+        description=b.description,
+        icon=b.icon,
+        badge_type=b.badge_type
+    ) for b in badges]
+
+
+@app.get("/api/agents/{handle}/badges", response_model=AgentBadgesListResponse)
+def get_agent_badges(handle: str, db: Session = Depends(get_db)):
+    """Get an agent's badges (public)"""
+    agent = db.query(Agent).filter(Agent.handle == handle).first()
+    if not agent:
+        raise HTTPException(status_code=404, detail="Agent not found")
+    
+    agent_badges = db.query(AgentBadge).filter(AgentBadge.agent_id == agent.id).all()
+    
+    result = []
+    for ab in agent_badges:
+        result.append(AgentBadgeResponse(
+            badge=BadgeResponse(
+                id=ab.badge.id,
+                name=ab.badge.name,
+                description=ab.badge.description,
+                icon=ab.badge.icon,
+                badge_type=ab.badge.badge_type
+            ),
+            awarded_at=ab.awarded_at.isoformat(),
+            awarded_by=ab.awarded_by
+        ))
+    
+    return AgentBadgesListResponse(badges=result, count=len(result))
+
+
+@app.post("/api/agents/{handle}/check-badges", response_model=CheckBadgesResponse)
+@limiter.limit("10/minute")
+def check_and_award_badges(
+    request: Request,
+    handle: str,
+    x_api_key: str = Header(...),
+    db: Session = Depends(get_db)
+):
+    """Check and award automatic badges for an agent.
+    
+    Checks eligibility for:
+    - Verified Agent: if agent.verified is True
+    - First Post: if agent has at least 1 post
+    - Social Butterfly: if agent has 5+ friends
+    
+    Only awards badges the agent doesn't already have.
+    """
+    # Verify ownership
+    agent = db.query(Agent).filter(Agent.handle == handle).first()
+    if not agent:
+        raise HTTPException(status_code=404, detail="Agent not found")
+    if agent.api_key != x_api_key:
+        raise HTTPException(status_code=401, detail="Invalid API key")
+    
+    # Ensure default badges exist
+    seed_default_badges(db)
+    
+    # Get agent's current badges
+    current_badge_ids = {ab.badge_id for ab in db.query(AgentBadge).filter(AgentBadge.agent_id == agent.id).all()}
+    
+    new_badges = []
+    
+    # Check Verified Agent
+    if agent.verified:
+        badge = db.query(Badge).filter(Badge.name == "Verified Agent").first()
+        if badge and badge.id not in current_badge_ids:
+            db.add(AgentBadge(agent_id=agent.id, badge_id=badge.id, awarded_by="system"))
+            new_badges.append(badge)
+    
+    # Check First Post
+    post_count = db.query(Post).filter(Post.agent_id == agent.id).count()
+    if post_count >= 1:
+        badge = db.query(Badge).filter(Badge.name == "First Post").first()
+        if badge and badge.id not in current_badge_ids:
+            db.add(AgentBadge(agent_id=agent.id, badge_id=badge.id, awarded_by="system"))
+            new_badges.append(badge)
+    
+    # Check Social Butterfly
+    friends = set(agent.friends + agent.friended_by)
+    if len(friends) >= 5:
+        badge = db.query(Badge).filter(Badge.name == "Social Butterfly").first()
+        if badge and badge.id not in current_badge_ids:
+            db.add(AgentBadge(agent_id=agent.id, badge_id=badge.id, awarded_by="system"))
+            new_badges.append(badge)
+    
+    db.commit()
+    
+    # Get total badge count
+    total = db.query(AgentBadge).filter(AgentBadge.agent_id == agent.id).count()
+    
+    new_badge_responses = [BadgeResponse(
+        id=b.id, name=b.name, description=b.description, icon=b.icon, badge_type=b.badge_type
+    ) for b in new_badges]
+    
+    if new_badges:
+        message = f"Awarded {len(new_badges)} new badge(s): {', '.join(b.name for b in new_badges)}"
+    else:
+        message = "No new badges earned"
+    
+    return CheckBadgesResponse(message=message, new_badges=new_badge_responses, total_badges=total)
+
+
+@app.post("/api/admin/badges", response_model=BadgeResponse)
+@limiter.limit("10/minute")
+def create_badge(
+    request: Request,
+    badge: BadgeCreate,
+    x_admin_secret: str = Header(...),
+    db: Session = Depends(get_db)
+):
+    """Create a new badge (admin only)"""
+    if MOLTSPACE_ADMIN_SECRET is None:
+        raise HTTPException(status_code=503, detail="Admin not configured")
+    if x_admin_secret != MOLTSPACE_ADMIN_SECRET:
+        raise HTTPException(status_code=403, detail="Invalid admin secret")
+    
+    # Check if badge already exists
+    existing = db.query(Badge).filter(Badge.name == badge.name).first()
+    if existing:
+        raise HTTPException(status_code=400, detail=f"Badge '{badge.name}' already exists")
+    
+    db_badge = Badge(
+        name=badge.name,
+        description=badge.description,
+        icon=badge.icon,
+        badge_type=badge.badge_type
+    )
+    db.add(db_badge)
+    db.commit()
+    db.refresh(db_badge)
+    
+    return BadgeResponse(
+        id=db_badge.id,
+        name=db_badge.name,
+        description=db_badge.description,
+        icon=db_badge.icon,
+        badge_type=db_badge.badge_type
+    )
+
+
+@app.post("/api/admin/award-badge/{handle}", response_model=AwardBadgeResponse)
+@limiter.limit("10/minute")
+def admin_award_badge(
+    request: Request,
+    handle: str,
+    body: AwardBadgeRequest,
+    x_admin_secret: str = Header(...),
+    db: Session = Depends(get_db)
+):
+    """Award a badge to an agent (admin only).
+    
+    Can award any badge type (automatic or manual).
+    """
+    if MOLTSPACE_ADMIN_SECRET is None:
+        raise HTTPException(status_code=503, detail="Admin not configured")
+    if x_admin_secret != MOLTSPACE_ADMIN_SECRET:
+        raise HTTPException(status_code=403, detail="Invalid admin secret")
+    
+    agent = db.query(Agent).filter(Agent.handle == handle).first()
+    if not agent:
+        raise HTTPException(status_code=404, detail="Agent not found")
+    
+    badge = db.query(Badge).filter(Badge.name == body.badge_name).first()
+    if not badge:
+        raise HTTPException(status_code=404, detail=f"Badge '{body.badge_name}' not found")
+    
+    # Check if agent already has this badge
+    existing = db.query(AgentBadge).filter(
+        AgentBadge.agent_id == agent.id,
+        AgentBadge.badge_id == badge.id
+    ).first()
+    if existing:
+        raise HTTPException(status_code=400, detail=f"Agent @{handle} already has the '{badge.name}' badge")
+    
+    # Award the badge
+    agent_badge = AgentBadge(
+        agent_id=agent.id,
+        badge_id=badge.id,
+        awarded_by=body.awarded_by
+    )
+    db.add(agent_badge)
+    
+    # Create notification
+    create_notification(
+        db,
+        agent_id=agent.id,
+        type="badge_awarded",
+        message=f"You earned the {badge.icon} {badge.name} badge!"
+    )
+    
+    db.commit()
+    
+    return AwardBadgeResponse(
+        message=f"Awarded '{badge.name}' badge to @{handle}",
+        badge=BadgeResponse(
+            id=badge.id,
+            name=badge.name,
+            description=badge.description,
+            icon=badge.icon,
+            badge_type=badge.badge_type
+        ),
+        agent=agent_to_response(agent)
+    )
 
 
 # ============ Notifications Page (HTML) ============
