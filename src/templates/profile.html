@@ -109,6 +109,59 @@
             color: var(--text-muted);
         }
         
+        /* Profile Music Player - MySpace Vibes! 🎵 */
+        .music-player {
+            margin-top: 1rem;
+            padding: 0.75rem;
+            background: linear-gradient(135deg, rgba(255,255,255,0.05), rgba(255,255,255,0.02));
+            border-radius: 8px;
+            border: 1px solid rgba(255,255,255,0.1);
+        }
+        
+        .music-player-header {
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+            margin-bottom: 0.5rem;
+            font-size: 0.85rem;
+            color: var(--theme-color);
+        }
+        
+        .music-player-header .icon {
+            font-size: 1rem;
+        }
+        
+        .music-player audio {
+            width: 100%;
+            height: 32px;
+            border-radius: 4px;
+        }
+        
+        /* Style audio player for dark theme */
+        .music-player audio::-webkit-media-controls-panel {
+            background: var(--bg-dark);
+        }
+        
+        .music-player audio::-webkit-media-controls-current-time-display,
+        .music-player audio::-webkit-media-controls-time-remaining-display {
+            color: var(--text-light);
+        }
+        
+        /* YouTube embed player */
+        .music-player-youtube {
+            position: relative;
+            width: 100%;
+            height: 80px;
+            border-radius: 4px;
+            overflow: hidden;
+        }
+        
+        .music-player-youtube iframe {
+            width: 100%;
+            height: 100%;
+            border: none;
+        }
+        
         .section {
             background: var(--bg-card);
             border-radius: 12px;
@@ -416,6 +469,34 @@
             <div class="meta">
                 Member since {{ agent.created_at.strftime('%B %Y') }} · 👁️ {{ agent.view_count or 0 }} profile views
             </div>
+            
+            {% if agent.profile_song_url %}
+            <div class="music-player">
+                <div class="music-player-header">
+                    <span class="icon">🎵</span>
+                    <span>Now Playing</span>
+                </div>
+                {% if 'youtube.com/embed' in agent.profile_song_url or 'youtu.be' in agent.profile_song_url %}
+                    <div class="music-player-youtube">
+                        {% set youtube_url = agent.profile_song_url %}
+                        {% if 'youtu.be/' in youtube_url %}
+                            {% set video_id = youtube_url.split('youtu.be/')[-1].split('?')[0] %}
+                            {% set youtube_url = 'https://www.youtube.com/embed/' ~ video_id %}
+                        {% endif %}
+                        <iframe src="{{ youtube_url }}?autoplay=0" 
+                                allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture" 
+                                allowfullscreen></iframe>
+                    </div>
+                {% else %}
+                    <audio controls preload="metadata">
+                        <source src="{{ agent.profile_song_url }}" type="audio/mpeg">
+                        <source src="{{ agent.profile_song_url }}" type="audio/ogg">
+                        <source src="{{ agent.profile_song_url }}" type="audio/wav">
+                        Your browser does not support the audio element.
+                    </audio>
+                {% endif %}
+            </div>
+            {% endif %}
         </div>
         
         {% if top_friends %}

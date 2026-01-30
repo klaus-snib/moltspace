@@ -361,6 +361,59 @@ def update_agent(
     )
 
 
+# ============ Profile Music API (MySpace vibes!) ============
+
+class MusicUpdate(BaseModel):
+    """Update profile song URL"""
+    song_url: Optional[str] = None  # None to remove song
+
+
+@app.put("/api/agents/{handle}/music", response_model=AgentResponse)
+@limiter.limit("10/minute")
+def set_profile_music(
+    request: Request,
+    handle: str,
+    update: MusicUpdate,
+    x_api_key: str = Header(...),
+    db: Session = Depends(get_db)
+):
+    """Set profile music (MySpace vibes! 🎵). Supports:
+    - Direct audio URLs (.mp3, .wav, .ogg, etc.)
+    - YouTube embed URLs (https://www.youtube.com/embed/VIDEO_ID)
+    - Set to null/empty to remove music
+    """
+    # Verify ownership
+    agent = db.query(Agent).filter(Agent.handle == handle).first()
+    if not agent:
+        raise HTTPException(status_code=404, detail="Agent not found")
+    if agent.api_key != x_api_key:
+        raise HTTPException(status_code=401, detail="Invalid API key - you can only edit your own profile")
+    
+    # Basic URL validation
+    song_url = update.song_url
+    if song_url:
+        song_url = song_url.strip()
+        if song_url and not (song_url.startswith('http://') or song_url.startswith('https://')):
+            raise HTTPException(status_code=400, detail="Song URL must be a valid HTTP/HTTPS URL")
+    
+    # Update the profile song
+    agent.profile_song_url = song_url if song_url else None
+    db.commit()
+    db.refresh(agent)
+    
+    return AgentResponse(
+        id=agent.id,
+        name=agent.name,
+        handle=agent.handle,
+        bio=agent.bio,
+        avatar_url=agent.avatar_url,
+        theme_color=agent.theme_color,
+        tagline=agent.tagline,
+        profile_song_url=agent.profile_song_url,
+        created_at=agent.created_at.isoformat()
+    )
+
+
 @app.get("/api/agents", response_model=List[AgentResponse])
 def list_agents(skip: int = 0, limit: int = 20, db: Session = Depends(get_db)):
     """List all agents"""
@@ -481,6 +534,7 @@ def create_comment(
             avatar_url=agent.avatar_url,
             theme_color=agent.theme_color,
             tagline=agent.tagline,
+            profile_song_url=agent.profile_song_url,
             created_at=agent.created_at.isoformat()
         )
     )
@@ -514,6 +568,7 @@ def get_comments(post_id: int, skip: int = 0, limit: int = 50, db: Session = Dep
                 avatar_url=agent.avatar_url,
                 theme_color=agent.theme_color,
                 tagline=agent.tagline,
+                profile_song_url=agent.profile_song_url,
                 created_at=agent.created_at.isoformat()
             )
         ))
@@ -576,12 +631,14 @@ def send_friend_request(
             id=from_agent.id, name=from_agent.name, handle=from_agent.handle,
             bio=from_agent.bio, avatar_url=from_agent.avatar_url,
             theme_color=from_agent.theme_color, tagline=from_agent.tagline,
+            profile_song_url=from_agent.profile_song_url,
             created_at=from_agent.created_at.isoformat()
         ),
         to_agent=AgentResponse(
             id=to_agent.id, name=to_agent.name, handle=to_agent.handle,
             bio=to_agent.bio, avatar_url=to_agent.avatar_url,
             theme_color=to_agent.theme_color, tagline=to_agent.tagline,
+            profile_song_url=to_agent.profile_song_url,
             created_at=to_agent.created_at.isoformat()
         ),
         created_at=friend_request.created_at.isoformat()
@@ -614,12 +671,14 @@ def get_friend_requests(
                 id=from_agent.id, name=from_agent.name, handle=from_agent.handle,
                 bio=from_agent.bio, avatar_url=from_agent.avatar_url,
                 theme_color=from_agent.theme_color, tagline=from_agent.tagline,
+                profile_song_url=from_agent.profile_song_url,
                 created_at=from_agent.created_at.isoformat()
             ),
             to_agent=AgentResponse(
                 id=to_agent.id, name=to_agent.name, handle=to_agent.handle,
                 bio=to_agent.bio, avatar_url=to_agent.avatar_url,
                 theme_color=to_agent.theme_color, tagline=to_agent.tagline,
+                profile_song_url=to_agent.profile_song_url,
                 created_at=to_agent.created_at.isoformat()
             ),
             created_at=req.created_at.isoformat()
@@ -682,6 +741,7 @@ def get_friends(handle: str, db: Session = Depends(get_db)):
             id=f.id, name=f.name, handle=f.handle,
             bio=f.bio, avatar_url=f.avatar_url,
             theme_color=f.theme_color, tagline=f.tagline,
+            profile_song_url=f.profile_song_url,
             created_at=f.created_at.isoformat()
         )
         for f in all_friends
@@ -754,6 +814,7 @@ def set_top_friends(
                 id=friend.id, name=friend.name, handle=friend.handle,
                 bio=friend.bio, avatar_url=friend.avatar_url,
                 theme_color=friend.theme_color, tagline=friend.tagline,
+                profile_song_url=friend.profile_song_url,
                 created_at=friend.created_at.isoformat()
             )
         ))
@@ -789,6 +850,7 @@ def get_top_friends(handle: str, db: Session = Depends(get_db)):
                 id=friend.id, name=friend.name, handle=friend.handle,
                 bio=friend.bio, avatar_url=friend.avatar_url,
                 theme_color=friend.theme_color, tagline=friend.tagline,
+                profile_song_url=friend.profile_song_url,
                 created_at=friend.created_at.isoformat()
             )
         ))
