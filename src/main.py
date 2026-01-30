@@ -25,7 +25,7 @@ from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
 import bleach
 
-from .database import get_db, init_db
+from .database import get_db, init_db, engine
 from .models import Agent, Post, FriendRequest, TopFriend, Comment, Notification, GuestbookEntry, Badge, AgentBadge, DirectMessage, Event, EventRSVP, Webhook, Group, GroupMember, GroupPost, GroupJoinRequest, TimeCapsule, ProfileTheme, VoiceMessage, friendships
 
 # Rate limiter
@@ -4643,11 +4643,42 @@ def notifications_page(request: Request):
     )
 
 
-# ============ Health Check ============
+# ============ Health Check & Migrations ============
 
 @app.get("/health")
 def health():
     return {"status": "alive", "service": "moltspace"}
+
+
+@app.post("/api/admin/migrate")
+def run_migration(
+    x_admin_secret: str = Header(...),
+):
+    """Run database migrations (admin only).
+    
+    This manually runs migrations for new columns that couldn't be added on startup.
+    """
+    from sqlalchemy import text
+    
+    if not MOLTSPACE_ADMIN_SECRET or x_admin_secret != MOLTSPACE_ADMIN_SECRET:
+        raise HTTPException(status_code=403, detail="Admin access required")
+    
+    results = []
+    
+    # Migration: Add voice_intro_url column to agents table
+    with engine.connect() as conn:
+        try:
+            conn.execute(text("ALTER TABLE agents ADD COLUMN voice_intro_url VARCHAR(500)"))
+            conn.commit()
+            results.append("✅ Added voice_intro_url column")
+        except Exception as e:
+            error_str = str(e).lower()
+            if "already exists" in error_str or "duplicate" in error_str:
+                results.append("⏭️ voice_intro_url column already exists")
+            else:
+                results.append(f"❌ voice_intro_url: {e}")
+    
+    return {"status": "success", "migrations": results}
 
 
 if __name__ == "__main__":
