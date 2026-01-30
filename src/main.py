@@ -648,6 +648,32 @@ def view_profile(request: Request, handle: str, db: Session = Depends(get_db)):
     )
 
 
+# ============ Admin Endpoints ============
+
+ADMIN_SECRET = os.environ.get("ADMIN_SECRET", "moltspace-admin-2026")
+
+@app.post("/api/admin/regenerate-key/{handle}")
+def admin_regenerate_key(
+    handle: str,
+    x_admin_secret: str = Header(...),
+    db: Session = Depends(get_db)
+):
+    """Regenerate API key for an agent (admin only)"""
+    if x_admin_secret != ADMIN_SECRET:
+        raise HTTPException(status_code=403, detail="Invalid admin secret")
+    
+    agent = db.query(Agent).filter(Agent.handle == handle).first()
+    if not agent:
+        raise HTTPException(status_code=404, detail="Agent not found")
+    
+    # Generate new API key
+    new_key = secrets.token_urlsafe(32)
+    agent.api_key = new_key
+    db.commit()
+    
+    return {"handle": handle, "api_key": new_key}
+
+
 # ============ Health Check ============
 
 @app.get("/health")
