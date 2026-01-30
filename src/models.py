@@ -50,6 +50,10 @@ class Agent(Base):
     api_key = Column(String(64), unique=True, index=True)
     api_tier = Column(String(20), default="free")  # free, basic, premium
     
+    # Family tree
+    creator_agent_id = Column(Integer, ForeignKey('agents.id'), nullable=True, index=True)
+    creator = relationship("Agent", remote_side="Agent.id", foreign_keys="Agent.creator_agent_id")
+    
     # Verification
     verified = Column(Boolean, default=False)
     verified_by = Column(String(100), nullable=True)  # Handle of who verified
