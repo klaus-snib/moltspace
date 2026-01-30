@@ -32,39 +32,41 @@ def run_migrations():
     
     SQLAlchemy's create_all doesn't add columns to existing tables,
     so we need to handle schema evolution manually.
-    """
-    from sqlalchemy import text, inspect
     
-    try:
-        # Check if table and column exist before trying to add it
-        inspector = inspect(engine)
-        
-        # Check if agents table exists
-        if 'agents' not in inspector.get_table_names():
-            print("ℹ️ Migration: agents table doesn't exist yet, skipping column migration")
-            return
-        
-        existing_columns = {col['name'] for col in inspector.get_columns('agents')}
-        
-        if 'voice_intro_url' not in existing_columns:
-            with engine.connect() as conn:
-                try:
-                    conn.execute(text("ALTER TABLE agents ADD COLUMN voice_intro_url VARCHAR(500)"))
-                    conn.commit()
-                    print("✅ Migration: Added voice_intro_url column")
-                except Exception as e:
-                    conn.rollback()
-                    print(f"⚠️ Migration warning (voice_intro_url): {e}")
-    except Exception as e:
-        print(f"⚠️ Migration check failed (non-fatal): {e}")
+    This runs BEFORE create_all to ensure columns exist for ORM queries.
+    """
+    from sqlalchemy import text
+    
+    # Migration: Add voice_intro_url column to agents table
+    # Just try the ALTER - if it fails (column exists, table doesn't exist, etc), ignore
+    with engine.connect() as conn:
+        try:
+            conn.execute(text("ALTER TABLE agents ADD COLUMN voice_intro_url VARCHAR(500)"))
+            conn.commit()
+            print("✅ Migration: Added voice_intro_url column")
+        except Exception as e:
+            # Expected errors: column already exists, table doesn't exist
+            # Both are fine - we just move on
+            try:
+                conn.rollback()
+            except:
+                pass  # Connection might be in auto-commit mode
+            error_str = str(e).lower()
+            if "already exists" in error_str or "duplicate" in error_str:
+                pass  # Column exists, good
+            elif "does not exist" in error_str or "no such table" in error_str:
+                pass  # Table doesn't exist, create_all will handle it
+            else:
+                print(f"ℹ️ Migration note (voice_intro_url): {e}")
 
 
 def init_db():
     """Create all tables and run migrations"""
-    # First create any new tables
-    Base.metadata.create_all(bind=engine)
-    # Then run column migrations
+    # Run column migrations FIRST (before ORM tries to use new columns)
+    # This ensures existing tables get new columns before create_all
     run_migrations()
+    # Then create any new tables (this won't modify existing tables)
+    Base.metadata.create_all(bind=engine)
 
 def get_db():
     """Dependency for FastAPI routes"""
