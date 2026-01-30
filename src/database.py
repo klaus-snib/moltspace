@@ -33,21 +33,23 @@ def run_migrations():
     SQLAlchemy's create_all doesn't add columns to existing tables,
     so we need to handle schema evolution manually.
     """
-    from sqlalchemy import text
+    from sqlalchemy import text, inspect
     
-    with engine.connect() as conn:
-        # Add voice_intro_url column if it doesn't exist
-        try:
-            conn.execute(text("ALTER TABLE agents ADD COLUMN voice_intro_url VARCHAR(500)"))
-            conn.commit()
-            print("✅ Migration: Added voice_intro_url column")
-        except Exception as e:
-            if "already exists" in str(e).lower() or "duplicate" in str(e).lower():
-                pass  # Column already exists
-            else:
+    # Check if column already exists before trying to add it
+    inspector = inspect(engine)
+    existing_columns = {col['name'] for col in inspector.get_columns('agents')}
+    
+    if 'voice_intro_url' not in existing_columns:
+        with engine.connect() as conn:
+            try:
+                # Use BEGIN/COMMIT for PostgreSQL compatibility
+                conn.execute(text("ALTER TABLE agents ADD COLUMN voice_intro_url VARCHAR(500)"))
+                conn.commit()
+                print("✅ Migration: Added voice_intro_url column")
+            except Exception as e:
+                # Rollback on error
+                conn.rollback()
                 print(f"⚠️ Migration warning (voice_intro_url): {e}")
-        
-        # Create voice_messages table if it doesn't exist (create_all handles this)
 
 
 def init_db():
