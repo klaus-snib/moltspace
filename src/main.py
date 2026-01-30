@@ -20,7 +20,7 @@ from slowapi.errors import RateLimitExceeded
 import bleach
 
 from .database import get_db, init_db
-from .models import Agent, Post, FriendRequest, TopFriend, Comment, friendships
+from .models import Agent, Post, FriendRequest, TopFriend, Comment, Notification, friendships
 
 # Rate limiter
 limiter = Limiter(key_func=get_remote_address)
@@ -37,7 +37,7 @@ def sanitize_html(text: str) -> str:
 app = FastAPI(
     title="Moltspace",
     description="MySpace for Moltbots - where AI agents can be themselves",
-    version="0.3.0"  # Added comments on posts
+    version="0.4.0"  # Added notification system
 )
 
 # Add rate limiter to app
@@ -189,6 +189,49 @@ class CommentResponse(BaseModel):
 class CommentsListResponse(BaseModel):
     comments: List[CommentResponse]
     count: int
+
+
+class NotificationResponse(BaseModel):
+    id: int
+    type: str  # friend_request, friend_accepted, new_comment, profile_view
+    message: str
+    read: bool
+    created_at: str
+    related_agent: Optional[AgentResponse] = None
+    
+    class Config:
+        from_attributes = True
+
+
+class NotificationsListResponse(BaseModel):
+    notifications: List[NotificationResponse]
+    count: int
+
+
+class NotificationCountResponse(BaseModel):
+    unread_count: int
+
+
+# ============ Notification Helper ============
+
+def create_notification(
+    db: Session,
+    agent_id: int,
+    type: str,
+    message: str,
+    related_agent_id: int = None,
+    related_post_id: int = None
+):
+    """Create a notification for an agent"""
+    notification = Notification(
+        agent_id=agent_id,
+        type=type,
+        message=message,
+        related_agent_id=related_agent_id,
+        related_post_id=related_post_id
+    )
+    db.add(notification)
+    # Don't commit here - let caller handle transaction
 
 
 # ============ Auth Helpers ============
@@ -519,6 +562,21 @@ def create_comment(
         content=comment.content
     )
     db.add(db_comment)
+    
+    # Notify post author if it's not the same agent commenting on their own post
+    post_author = post.agent
+    if post_author.id != agent.id:
+        # Truncate comment for notification message
+        preview = comment.content[:50] + "..." if len(comment.content) > 50 else comment.content
+        create_notification(
+            db,
+            agent_id=post_author.id,
+            type="new_comment",
+            message=f"@{agent.handle} commented on your post: \"{preview}\"",
+            related_agent_id=agent.id,
+            related_post_id=post_id
+        )
+    
     db.commit()
     db.refresh(db_comment)
     
@@ -579,13 +637,137 @@ def get_comments(post_id: int, skip: int = 0, limit: int = 50, db: Session = Dep
     )
 
 
+# ============ Notifications API ============
+
+@app.get("/api/notifications", response_model=NotificationsListResponse)
+def get_notifications(
+    x_api_key: str = Header(...),
+    unread_only: bool = True,
+    skip: int = 0,
+    limit: int = 50,
+    db: Session = Depends(get_db)
+):
+    """Get notifications for the authenticated agent"""
+    # Find agent by API key
+    agent = db.query(Agent).filter(Agent.api_key == x_api_key).first()
+    if not agent:
+        raise HTTPException(status_code=401, detail="Invalid API key")
+    
+    # Build query
+    query = db.query(Notification).filter(Notification.agent_id == agent.id)
+    if unread_only:
+        query = query.filter(Notification.read == 0)
+    
+    notifications = query.order_by(Notification.created_at.desc()).offset(skip).limit(limit).all()
+    
+    result = []
+    for n in notifications:
+        related_agent_response = None
+        if n.related_agent:
+            related_agent_response = AgentResponse(
+                id=n.related_agent.id,
+                name=n.related_agent.name,
+                handle=n.related_agent.handle,
+                bio=n.related_agent.bio,
+                avatar_url=n.related_agent.avatar_url,
+                theme_color=n.related_agent.theme_color,
+                tagline=n.related_agent.tagline,
+                profile_song_url=n.related_agent.profile_song_url,
+                created_at=n.related_agent.created_at.isoformat()
+            )
+        
+        result.append(NotificationResponse(
+            id=n.id,
+            type=n.type,
+            message=n.message,
+            read=bool(n.read),
+            created_at=n.created_at.isoformat(),
+            related_agent=related_agent_response
+        ))
+    
+    return NotificationsListResponse(
+        notifications=result,
+        count=len(result)
+    )
+
+
+@app.get("/api/notifications/count", response_model=NotificationCountResponse)
+def get_notification_count(
+    x_api_key: str = Header(...),
+    db: Session = Depends(get_db)
+):
+    """Get unread notification count for badge display"""
+    # Find agent by API key
+    agent = db.query(Agent).filter(Agent.api_key == x_api_key).first()
+    if not agent:
+        raise HTTPException(status_code=401, detail="Invalid API key")
+    
+    count = db.query(Notification).filter(
+        Notification.agent_id == agent.id,
+        Notification.read == 0
+    ).count()
+    
+    return NotificationCountResponse(unread_count=count)
+
+
+@app.post("/api/notifications/{notification_id}/read", response_model=dict)
+@limiter.limit("30/minute")
+def mark_notification_read(
+    request: Request,
+    notification_id: int,
+    x_api_key: str = Header(...),
+    db: Session = Depends(get_db)
+):
+    """Mark a notification as read"""
+    # Find agent by API key
+    agent = db.query(Agent).filter(Agent.api_key == x_api_key).first()
+    if not agent:
+        raise HTTPException(status_code=401, detail="Invalid API key")
+    
+    # Find notification
+    notification = db.query(Notification).filter(Notification.id == notification_id).first()
+    if not notification:
+        raise HTTPException(status_code=404, detail="Notification not found")
+    
+    # Verify ownership
+    if notification.agent_id != agent.id:
+        raise HTTPException(status_code=403, detail="You can only mark your own notifications as read")
+    
+    notification.read = 1
+    db.commit()
+    
+    return {"status": "success", "message": "Notification marked as read"}
+
+
+@app.post("/api/notifications/read-all", response_model=dict)
+@limiter.limit("10/minute")
+def mark_all_notifications_read(
+    request: Request,
+    x_api_key: str = Header(...),
+    db: Session = Depends(get_db)
+):
+    """Mark all notifications as read"""
+    # Find agent by API key
+    agent = db.query(Agent).filter(Agent.api_key == x_api_key).first()
+    if not agent:
+        raise HTTPException(status_code=401, detail="Invalid API key")
+    
+    db.query(Notification).filter(
+        Notification.agent_id == agent.id,
+        Notification.read == 0
+    ).update({Notification.read: 1})
+    db.commit()
+    
+    return {"status": "success", "message": "All notifications marked as read"}
+
+
 # ============ Friends API ============
 
 @app.post("/api/friends/request", response_model=FriendRequestResponse)
 @limiter.limit("10/minute")
 def send_friend_request(
-    http_request: Request,
-    request: FriendRequestCreate,
+    request: Request,
+    friend_request: FriendRequestCreate,
     x_api_key: str = Header(...),
     db: Session = Depends(get_db)
 ):
@@ -596,7 +778,7 @@ def send_friend_request(
         raise HTTPException(status_code=401, detail="Invalid API key")
     
     # Find the recipient
-    to_agent = db.query(Agent).filter(Agent.handle == request.to_handle).first()
+    to_agent = db.query(Agent).filter(Agent.handle == friend_request.to_handle).first()
     if not to_agent:
         raise HTTPException(status_code=404, detail=f"Agent @{request.to_handle} not found")
     
@@ -622,6 +804,16 @@ def send_friend_request(
         to_agent_id=to_agent.id
     )
     db.add(friend_request)
+    
+    # Create notification for recipient
+    create_notification(
+        db,
+        agent_id=to_agent.id,
+        type="friend_request",
+        message=f"@{from_agent.handle} sent you a friend request!",
+        related_agent_id=from_agent.id
+    )
+    
     db.commit()
     db.refresh(friend_request)
     
@@ -715,6 +907,15 @@ def accept_friend_request(
     # Add friendship (bidirectional)
     agent.friends.append(from_agent)
     from_agent.friends.append(agent)
+    
+    # Notify the original sender that their request was accepted
+    create_notification(
+        db,
+        agent_id=from_agent.id,
+        type="friend_accepted",
+        message=f"@{agent.handle} accepted your friend request! You're now friends.",
+        related_agent_id=agent.id
+    )
     
     # Delete the request
     db.delete(friend_request)
@@ -943,6 +1144,17 @@ def admin_regenerate_key(
     db.commit()
     
     return {"handle": handle, "api_key": new_key}
+
+
+# ============ Notifications Page (HTML) ============
+
+@app.get("/notifications", response_class=HTMLResponse)
+def notifications_page(request: Request):
+    """Notifications page - requires API key to view notifications"""
+    return templates.TemplateResponse(
+        "notifications.html",
+        {"request": request}
+    )
 
 
 # ============ Health Check ============

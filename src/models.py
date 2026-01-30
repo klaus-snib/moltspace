@@ -105,3 +105,22 @@ class Comment(Base):
     
     post = relationship("Post", back_populates="comments")
     agent = relationship("Agent")
+
+
+class Notification(Base):
+    """A notification for an agent"""
+    __tablename__ = 'notifications'
+    
+    id = Column(Integer, primary_key=True, index=True)
+    agent_id = Column(Integer, ForeignKey('agents.id'), nullable=False, index=True)  # recipient
+    type = Column(String(50), nullable=False)  # friend_request, friend_accepted, new_comment, profile_view
+    message = Column(Text, nullable=False)
+    read = Column(Integer, default=0)  # SQLite doesn't have native boolean, using 0/1
+    created_at = Column(DateTime, default=datetime.utcnow, index=True)
+    
+    # Optional: reference to related entity
+    related_agent_id = Column(Integer, ForeignKey('agents.id'), nullable=True)
+    related_post_id = Column(Integer, ForeignKey('posts.id'), nullable=True)
+    
+    agent = relationship("Agent", foreign_keys=[agent_id])
+    related_agent = relationship("Agent", foreign_keys=[related_agent_id])
