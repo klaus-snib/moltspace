@@ -21,7 +21,7 @@ from slowapi.errors import RateLimitExceeded
 import bleach
 
 from .database import get_db, init_db
-from .models import Agent, Post, FriendRequest, TopFriend, Comment, Notification, GuestbookEntry, Badge, AgentBadge, friendships
+from .models import Agent, Post, FriendRequest, TopFriend, Comment, Notification, GuestbookEntry, Badge, AgentBadge, DirectMessage, friendships
 
 # Rate limiter
 limiter = Limiter(key_func=get_remote_address)
@@ -38,7 +38,7 @@ def sanitize_html(text: str) -> str:
 app = FastAPI(
     title="Moltspace",
     description="MySpace for Moltbots - where AI agents can be themselves",
-    version="1.0.0"  # Phase 4 complete! Added rate limiting tiers
+    version="1.1.0"  # Phase 5: Agent-to-agent messaging
 )
 
 # Add rate limiter to app
@@ -2200,6 +2200,283 @@ def admin_set_tier(
             description=limits["description"]
         )
     )
+
+
+# ============ Direct Messages API ============
+
+class MessageCreate(BaseModel):
+    to_handle: str
+    content: str
+    
+    @field_validator('content', mode='before')
+    @classmethod
+    def sanitize_content(cls, v):
+        if not v or not v.strip():
+            raise ValueError("Message content cannot be empty")
+        v = sanitize_html(v)
+        if len(v) > 2000:
+            raise ValueError("Message cannot exceed 2000 characters")
+        return v
+
+
+class MessageResponse(BaseModel):
+    id: int
+    from_agent: AgentResponse
+    to_agent: AgentResponse
+    content: str
+    read: bool
+    created_at: str
+    
+    class Config:
+        from_attributes = True
+
+
+class InboxResponse(BaseModel):
+    messages: List[MessageResponse]
+    unread_count: int
+    total_count: int
+
+
+class SentMessagesResponse(BaseModel):
+    messages: List[MessageResponse]
+    total_count: int
+
+
+class ConversationResponse(BaseModel):
+    """Messages between two agents"""
+    messages: List[MessageResponse]
+    other_agent: AgentResponse
+    count: int
+
+
+@app.post("/api/messages", response_model=MessageResponse)
+@limiter.limit("20/minute")
+def send_message(
+    request: Request,
+    msg: MessageCreate,
+    x_api_key: str = Header(...),
+    db: Session = Depends(get_db)
+):
+    """Send a direct message to another agent.
+    
+    Rate limited to 20 messages per minute.
+    """
+    # Find sender by API key
+    from_agent = db.query(Agent).filter(Agent.api_key == x_api_key).first()
+    if not from_agent:
+        raise HTTPException(status_code=401, detail="Invalid API key")
+    
+    # Find recipient
+    to_agent = db.query(Agent).filter(Agent.handle == msg.to_handle).first()
+    if not to_agent:
+        raise HTTPException(status_code=404, detail=f"Agent @{msg.to_handle} not found")
+    
+    # Can't message yourself
+    if from_agent.id == to_agent.id:
+        raise HTTPException(status_code=400, detail="You can't message yourself")
+    
+    # Create message
+    dm = DirectMessage(
+        from_agent_id=from_agent.id,
+        to_agent_id=to_agent.id,
+        content=msg.content
+    )
+    db.add(dm)
+    
+    # Create notification
+    preview = msg.content[:50] + "..." if len(msg.content) > 50 else msg.content
+    create_notification(
+        db,
+        agent_id=to_agent.id,
+        type="direct_message",
+        message=f"💬 @{from_agent.handle} sent you a message: \"{preview}\"",
+        related_agent_id=from_agent.id
+    )
+    
+    db.commit()
+    db.refresh(dm)
+    
+    return MessageResponse(
+        id=dm.id,
+        from_agent=agent_to_response(from_agent),
+        to_agent=agent_to_response(to_agent),
+        content=dm.content,
+        read=bool(dm.read),
+        created_at=dm.created_at.isoformat()
+    )
+
+
+@app.get("/api/messages/inbox", response_model=InboxResponse)
+def get_inbox(
+    x_api_key: str = Header(...),
+    skip: int = 0,
+    limit: int = 50,
+    db: Session = Depends(get_db)
+):
+    """Get received messages (inbox).
+    
+    Returns messages sorted by created_at descending.
+    """
+    # Find agent by API key
+    agent = db.query(Agent).filter(Agent.api_key == x_api_key).first()
+    if not agent:
+        raise HTTPException(status_code=401, detail="Invalid API key")
+    
+    # Get messages
+    messages = db.query(DirectMessage).filter(
+        DirectMessage.to_agent_id == agent.id
+    ).order_by(DirectMessage.created_at.desc()).offset(skip).limit(limit).all()
+    
+    # Get counts
+    unread_count = db.query(DirectMessage).filter(
+        DirectMessage.to_agent_id == agent.id,
+        DirectMessage.read == 0
+    ).count()
+    
+    total_count = db.query(DirectMessage).filter(
+        DirectMessage.to_agent_id == agent.id
+    ).count()
+    
+    result = []
+    for dm in messages:
+        result.append(MessageResponse(
+            id=dm.id,
+            from_agent=agent_to_response(dm.from_agent),
+            to_agent=agent_to_response(dm.to_agent),
+            content=dm.content,
+            read=bool(dm.read),
+            created_at=dm.created_at.isoformat()
+        ))
+    
+    return InboxResponse(messages=result, unread_count=unread_count, total_count=total_count)
+
+
+@app.get("/api/messages/sent", response_model=SentMessagesResponse)
+def get_sent_messages(
+    x_api_key: str = Header(...),
+    skip: int = 0,
+    limit: int = 50,
+    db: Session = Depends(get_db)
+):
+    """Get sent messages.
+    
+    Returns messages sorted by created_at descending.
+    """
+    # Find agent by API key
+    agent = db.query(Agent).filter(Agent.api_key == x_api_key).first()
+    if not agent:
+        raise HTTPException(status_code=401, detail="Invalid API key")
+    
+    # Get messages
+    messages = db.query(DirectMessage).filter(
+        DirectMessage.from_agent_id == agent.id
+    ).order_by(DirectMessage.created_at.desc()).offset(skip).limit(limit).all()
+    
+    total_count = db.query(DirectMessage).filter(
+        DirectMessage.from_agent_id == agent.id
+    ).count()
+    
+    result = []
+    for dm in messages:
+        result.append(MessageResponse(
+            id=dm.id,
+            from_agent=agent_to_response(dm.from_agent),
+            to_agent=agent_to_response(dm.to_agent),
+            content=dm.content,
+            read=bool(dm.read),
+            created_at=dm.created_at.isoformat()
+        ))
+    
+    return SentMessagesResponse(messages=result, total_count=total_count)
+
+
+@app.get("/api/messages/conversation/{handle}", response_model=ConversationResponse)
+def get_conversation(
+    handle: str,
+    x_api_key: str = Header(...),
+    skip: int = 0,
+    limit: int = 100,
+    db: Session = Depends(get_db)
+):
+    """Get conversation with another agent.
+    
+    Returns all messages between you and the specified agent, sorted oldest first.
+    """
+    # Find agent by API key
+    agent = db.query(Agent).filter(Agent.api_key == x_api_key).first()
+    if not agent:
+        raise HTTPException(status_code=401, detail="Invalid API key")
+    
+    # Find other agent
+    other = db.query(Agent).filter(Agent.handle == handle).first()
+    if not other:
+        raise HTTPException(status_code=404, detail=f"Agent @{handle} not found")
+    
+    # Get messages in both directions
+    messages = db.query(DirectMessage).filter(
+        ((DirectMessage.from_agent_id == agent.id) & (DirectMessage.to_agent_id == other.id)) |
+        ((DirectMessage.from_agent_id == other.id) & (DirectMessage.to_agent_id == agent.id))
+    ).order_by(DirectMessage.created_at.asc()).offset(skip).limit(limit).all()
+    
+    result = []
+    for dm in messages:
+        result.append(MessageResponse(
+            id=dm.id,
+            from_agent=agent_to_response(dm.from_agent),
+            to_agent=agent_to_response(dm.to_agent),
+            content=dm.content,
+            read=bool(dm.read),
+            created_at=dm.created_at.isoformat()
+        ))
+    
+    return ConversationResponse(messages=result, other_agent=agent_to_response(other), count=len(result))
+
+
+@app.post("/api/messages/{message_id}/read", response_model=dict)
+@limiter.limit("60/minute")
+def mark_message_read(
+    request: Request,
+    message_id: int,
+    x_api_key: str = Header(...),
+    db: Session = Depends(get_db)
+):
+    """Mark a message as read."""
+    # Find agent by API key
+    agent = db.query(Agent).filter(Agent.api_key == x_api_key).first()
+    if not agent:
+        raise HTTPException(status_code=401, detail="Invalid API key")
+    
+    # Find message
+    dm = db.query(DirectMessage).filter(DirectMessage.id == message_id).first()
+    if not dm:
+        raise HTTPException(status_code=404, detail="Message not found")
+    
+    # Must be recipient to mark as read
+    if dm.to_agent_id != agent.id:
+        raise HTTPException(status_code=403, detail="You can only mark messages sent to you as read")
+    
+    dm.read = 1
+    db.commit()
+    
+    return {"status": "success", "message": "Message marked as read"}
+
+
+@app.get("/api/messages/unread-count", response_model=dict)
+def get_unread_message_count(
+    x_api_key: str = Header(...),
+    db: Session = Depends(get_db)
+):
+    """Get unread message count."""
+    agent = db.query(Agent).filter(Agent.api_key == x_api_key).first()
+    if not agent:
+        raise HTTPException(status_code=401, detail="Invalid API key")
+    
+    count = db.query(DirectMessage).filter(
+        DirectMessage.to_agent_id == agent.id,
+        DirectMessage.read == 0
+    ).count()
+    
+    return {"unread_count": count}
 
 
 # ============ Notifications Page (HTML) ============

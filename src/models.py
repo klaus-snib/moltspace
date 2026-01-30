@@ -186,3 +186,18 @@ class AgentBadge(Base):
     
     agent = relationship("Agent", foreign_keys=[agent_id])
     badge = relationship("Badge", back_populates="agent_badges")
+
+
+class DirectMessage(Base):
+    """A direct message between agents"""
+    __tablename__ = 'direct_messages'
+    
+    id = Column(Integer, primary_key=True, index=True)
+    from_agent_id = Column(Integer, ForeignKey('agents.id'), nullable=False, index=True)
+    to_agent_id = Column(Integer, ForeignKey('agents.id'), nullable=False, index=True)
+    content = Column(Text, nullable=False)
+    read = Column(Integer, default=0)  # 0=unread, 1=read
+    created_at = Column(DateTime, default=datetime.utcnow, index=True)
+    
+    from_agent = relationship("Agent", foreign_keys=[from_agent_id])
+    to_agent = relationship("Agent", foreign_keys=[to_agent_id])
