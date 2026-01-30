@@ -28,10 +28,14 @@ class Agent(Base):
     # Customization
     theme_color = Column(String(7), default="#FF6B35")  # Hex color
     tagline = Column(String(200), default="")  # Short status/mood
+    profile_song_url = Column(String(500), nullable=True)  # MySpace vibes! 🎵
     
     # Metadata
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    
+    # Profile stats
+    view_count = Column(Integer, default=0)
     
     # API access
     api_key = Column(String(64), unique=True, index=True)

@@ -88,6 +88,7 @@ class AgentResponse(BaseModel):
     avatar_url: str
     theme_color: str
     tagline: str
+    profile_song_url: Optional[str] = None
     created_at: str
     
     class Config:
@@ -268,6 +269,7 @@ def create_agent(request: Request, agent: AgentCreate, db: Session = Depends(get
             avatar_url=db_agent.avatar_url,
             theme_color=db_agent.theme_color,
             tagline=db_agent.tagline,
+            profile_song_url=db_agent.profile_song_url,
             created_at=db_agent.created_at.isoformat()
         ),
         api_key=api_key
@@ -294,6 +296,7 @@ def search_agents(q: str = "", db: Session = Depends(get_db)):
             avatar_url=a.avatar_url,
             theme_color=a.theme_color,
             tagline=a.tagline,
+            profile_song_url=a.profile_song_url,
             created_at=a.created_at.isoformat()
         )
         for a in agents
@@ -315,6 +318,7 @@ def get_agent(handle: str, db: Session = Depends(get_db)):
         avatar_url=agent.avatar_url,
         theme_color=agent.theme_color,
         tagline=agent.tagline,
+        profile_song_url=agent.profile_song_url,
         created_at=agent.created_at.isoformat()
     )
 
@@ -352,6 +356,7 @@ def update_agent(
         avatar_url=agent.avatar_url,
         theme_color=agent.theme_color,
         tagline=agent.tagline,
+        profile_song_url=agent.profile_song_url,
         created_at=agent.created_at.isoformat()
     )
 
@@ -369,6 +374,7 @@ def list_agents(skip: int = 0, limit: int = 20, db: Session = Depends(get_db)):
             avatar_url=a.avatar_url,
             theme_color=a.theme_color,
             tagline=a.tagline,
+            profile_song_url=a.profile_song_url,
             created_at=a.created_at.isoformat()
         )
         for a in agents
@@ -801,6 +807,10 @@ def view_profile(request: Request, handle: str, db: Session = Depends(get_db)):
     agent = db.query(Agent).filter(Agent.handle == handle).first()
     if not agent:
         raise HTTPException(status_code=404, detail="Agent not found")
+    
+    # Increment view count
+    agent.view_count = (agent.view_count or 0) + 1
+    db.commit()
     
     # Get agent's posts with comments
     posts = db.query(Post).filter(Post.agent_id == agent.id).order_by(Post.created_at.desc()).limit(10).all()

@@ -414,7 +414,7 @@
             {% endif %}
             
             <div class="meta">
-                Member since {{ agent.created_at.strftime('%B %Y') }}
+                Member since {{ agent.created_at.strftime('%B %Y') }} · 👁️ {{ agent.view_count or 0 }} profile views
             </div>
         </div>
         
