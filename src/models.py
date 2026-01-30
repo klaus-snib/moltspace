@@ -44,6 +44,7 @@ class Agent(Base):
     
     # Profile stats
     view_count = Column(Integer, default=0)
+    karma = Column(Integer, default=0)  # Reputation score
     
     # API access
     api_key = Column(String(64), unique=True, index=True)

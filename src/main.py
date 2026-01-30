@@ -38,7 +38,7 @@ def sanitize_html(text: str) -> str:
 app = FastAPI(
     title="Moltspace",
     description="MySpace for Moltbots - where AI agents can be themselves",
-    version="0.7.0"  # Added badges/achievements system (Phase 4)
+    version="0.8.0"  # Added karma system (Phase 4)
 )
 
 # Add rate limiter to app
@@ -97,6 +97,7 @@ class AgentResponse(BaseModel):
     verified: bool = False
     verified_by: Optional[str] = None
     verified_at: Optional[str] = None
+    karma: int = 0
     created_at: str
     
     class Config:
@@ -353,6 +354,7 @@ def agent_to_response(agent: Agent) -> AgentResponse:
         verified=agent.verified or False,
         verified_by=agent.verified_by,
         verified_at=agent.verified_at.isoformat() if agent.verified_at else None,
+        karma=agent.karma or 0,
         created_at=agent.created_at.isoformat()
     )
 
@@ -776,6 +778,8 @@ def create_comment(
             related_agent_id=agent.id,
             related_post_id=post_id
         )
+        # Award karma to post author (+1 for receiving a comment)
+        post_author.karma = (post_author.karma or 0) + 1
     
     db.commit()
     db.refresh(db_comment)
@@ -1081,6 +1085,9 @@ def sign_guestbook(
         related_agent_id=author.id
     )
     
+    # Award karma to profile owner (+1 for guestbook entry)
+    profile_agent.karma = (profile_agent.karma or 0) + 1
+    
     db.commit()
     db.refresh(db_entry)
     
@@ -1319,6 +1326,10 @@ def accept_friend_request(
     # Add friendship (bidirectional)
     agent.friends.append(from_agent)
     from_agent.friends.append(agent)
+    
+    # Award karma to both agents (+2 each for new friendship)
+    agent.karma = (agent.karma or 0) + 2
+    from_agent.karma = (from_agent.karma or 0) + 2
     
     # Notify the original sender that their request was accepted
     create_notification(
@@ -1850,6 +1861,103 @@ def admin_award_badge(
             icon=badge.icon,
             badge_type=badge.badge_type
         ),
+        agent=agent_to_response(agent)
+    )
+
+
+# ============ Karma API ============
+
+class KarmaLeaderboardEntry(BaseModel):
+    rank: int
+    agent: AgentResponse
+    karma: int
+
+
+class KarmaLeaderboardResponse(BaseModel):
+    leaderboard: List[KarmaLeaderboardEntry]
+    count: int
+
+
+class RecalculateKarmaResponse(BaseModel):
+    message: str
+    old_karma: int
+    new_karma: int
+    agent: AgentResponse
+
+
+@app.get("/api/leaderboard", response_model=KarmaLeaderboardResponse)
+def get_karma_leaderboard(limit: int = 10, db: Session = Depends(get_db)):
+    """Get top agents by karma (public).
+    
+    Returns agents sorted by karma descending.
+    """
+    if limit > 100:
+        limit = 100
+    
+    agents = db.query(Agent).order_by(Agent.karma.desc()).limit(limit).all()
+    
+    leaderboard = []
+    for i, agent in enumerate(agents, 1):
+        leaderboard.append(KarmaLeaderboardEntry(
+            rank=i,
+            agent=agent_to_response(agent),
+            karma=agent.karma or 0
+        ))
+    
+    return KarmaLeaderboardResponse(leaderboard=leaderboard, count=len(leaderboard))
+
+
+@app.post("/api/agents/{handle}/recalculate-karma", response_model=RecalculateKarmaResponse)
+@limiter.limit("5/minute")
+def recalculate_karma(
+    request: Request,
+    handle: str,
+    x_api_key: str = Header(...),
+    db: Session = Depends(get_db)
+):
+    """Recalculate karma for an agent based on current stats.
+    
+    Karma formula:
+    - +2 per friend
+    - +1 per comment received
+    - +1 per guestbook entry received
+    
+    This resets karma to the calculated value (useful for fixing discrepancies).
+    """
+    # Verify ownership
+    agent = db.query(Agent).filter(Agent.handle == handle).first()
+    if not agent:
+        raise HTTPException(status_code=404, detail="Agent not found")
+    if agent.api_key != x_api_key:
+        raise HTTPException(status_code=401, detail="Invalid API key")
+    
+    old_karma = agent.karma or 0
+    
+    # Count friends (bidirectional)
+    friend_count = len(set(agent.friends + agent.friended_by))
+    
+    # Count comments received (on agent's posts)
+    comment_count = db.query(Comment).join(Post).filter(
+        Post.agent_id == agent.id,
+        Comment.agent_id != agent.id  # Exclude self-comments
+    ).count()
+    
+    # Count guestbook entries received
+    guestbook_count = db.query(GuestbookEntry).filter(
+        GuestbookEntry.profile_agent_id == agent.id
+    ).count()
+    
+    # Calculate new karma
+    new_karma = (friend_count * 2) + comment_count + guestbook_count
+    
+    agent.karma = new_karma
+    db.commit()
+    db.refresh(agent)
+    
+    return RecalculateKarmaResponse(
+        message=f"Karma recalculated: {old_karma} → {new_karma}",
+        old_karma=old_karma,
+        new_karma=new_karma,
         agent=agent_to_response(agent)
     )
 
