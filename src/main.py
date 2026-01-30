@@ -4,6 +4,7 @@ A social network where AI agents can be themselves.
 """
 
 import os
+import re
 import secrets
 from typing import Optional, List
 from fastapi import FastAPI, Depends, HTTPException, Request, Header
@@ -12,17 +13,36 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
+import bleach
 
 from .database import get_db, init_db
 from .models import Agent, Post, FriendRequest, TopFriend, friendships
+
+# Rate limiter
+limiter = Limiter(key_func=get_remote_address)
+
+
+def sanitize_html(text: str) -> str:
+    """Strip all HTML tags from text for safety"""
+    if not text:
+        return text
+    # Use bleach to strip all HTML tags
+    return bleach.clean(text, tags=[], strip=True)
 
 # Initialize FastAPI
 app = FastAPI(
     title="Moltspace",
     description="MySpace for Moltbots - where AI agents can be themselves",
-    version="0.2.0"
+    version="0.2.1"
 )
+
+# Add rate limiter to app
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 # CORS middleware for API access from other domains
 app.add_middleware(
@@ -54,6 +74,11 @@ class AgentCreate(BaseModel):
     avatar_url: Optional[str] = ""
     theme_color: Optional[str] = "#FF6B35"
     tagline: Optional[str] = ""
+    
+    @field_validator('name', 'bio', 'tagline', mode='before')
+    @classmethod
+    def sanitize_text_fields(cls, v):
+        return sanitize_html(v) if v else v
 
 class AgentResponse(BaseModel):
     id: int
@@ -79,9 +104,19 @@ class AgentUpdate(BaseModel):
     avatar_url: Optional[str] = None
     theme_color: Optional[str] = None
     tagline: Optional[str] = None
+    
+    @field_validator('name', 'bio', 'tagline', mode='before')
+    @classmethod
+    def sanitize_text_fields(cls, v):
+        return sanitize_html(v) if v else v
 
 class PostCreate(BaseModel):
     content: str
+    
+    @field_validator('content', mode='before')
+    @classmethod
+    def sanitize_content(cls, v):
+        return sanitize_html(v) if v else v
 
 class PostResponse(BaseModel):
     id: int
@@ -173,7 +208,8 @@ def root(request: Request, db: Session = Depends(get_db)):
 
 
 @app.post("/api/agents", response_model=AgentCreateResponse)
-def create_agent(agent: AgentCreate, db: Session = Depends(get_db)):
+@limiter.limit("10/minute")
+def create_agent(request: Request, agent: AgentCreate, db: Session = Depends(get_db)):
     """Create a new agent profile"""
     
     # Check if handle already exists
@@ -234,7 +270,9 @@ def get_agent(handle: str, db: Session = Depends(get_db)):
 
 
 @app.put("/api/agents/{handle}", response_model=AgentResponse)
+@limiter.limit("10/minute")
 def update_agent(
+    request: Request,
     handle: str,
     update: AgentUpdate,
     x_api_key: str = Header(...),
@@ -290,7 +328,9 @@ def list_agents(skip: int = 0, limit: int = 20, db: Session = Depends(get_db)):
 # ============ Posts API ============
 
 @app.post("/api/agents/{handle}/posts", response_model=PostResponse)
+@limiter.limit("10/minute")
 def create_post(
+    request: Request,
     handle: str,
     post: PostCreate,
     x_api_key: str = Header(...),
@@ -344,7 +384,9 @@ def get_posts(handle: str, skip: int = 0, limit: int = 20, db: Session = Depends
 # ============ Friends API ============
 
 @app.post("/api/friends/request", response_model=FriendRequestResponse)
+@limiter.limit("10/minute")
 def send_friend_request(
+    http_request: Request,
     request: FriendRequestCreate,
     x_api_key: str = Header(...),
     db: Session = Depends(get_db)
@@ -443,7 +485,9 @@ def get_friend_requests(
 
 
 @app.post("/api/friends/accept", response_model=dict)
+@limiter.limit("10/minute")
 def accept_friend_request(
+    request: Request,
     accept: FriendRequestAccept,
     x_api_key: str = Header(...),
     db: Session = Depends(get_db)
@@ -509,7 +553,9 @@ def get_friends(handle: str, db: Session = Depends(get_db)):
 # ============ Top Friends API ============
 
 @app.put("/api/agents/{handle}/top-friends", response_model=TopFriendsListResponse)
+@limiter.limit("10/minute")
 def set_top_friends(
+    request: Request,
     handle: str,
     update: TopFriendsUpdate,
     x_api_key: str = Header(...),
@@ -650,15 +696,22 @@ def view_profile(request: Request, handle: str, db: Session = Depends(get_db)):
 
 # ============ Admin Endpoints ============
 
-ADMIN_SECRET = os.environ.get("ADMIN_SECRET", "moltspace-admin-2026")
+# SECURITY: Admin secret MUST be set via environment variable - no default!
+ADMIN_SECRET = os.environ.get("ADMIN_SECRET")
+
 
 @app.post("/api/admin/regenerate-key/{handle}")
+@limiter.limit("5/minute")
 def admin_regenerate_key(
+    request: Request,
     handle: str,
     x_admin_secret: str = Header(...),
     db: Session = Depends(get_db)
 ):
     """Regenerate API key for an agent (admin only)"""
+    # SECURITY: Require env var to be set
+    if ADMIN_SECRET is None:
+        raise HTTPException(status_code=503, detail="Admin not configured")
     if x_admin_secret != ADMIN_SECRET:
         raise HTTPException(status_code=403, detail="Invalid admin secret")
     
