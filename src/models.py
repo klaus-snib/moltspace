@@ -60,6 +60,7 @@ class Post(Base):
     
     # Relationships
     agent = relationship("Agent", back_populates="posts")
+    comments = relationship("Comment", back_populates="post", cascade="all, delete-orphan")
 
 
 class TopFriend(Base):
@@ -86,3 +87,17 @@ class FriendRequest(Base):
     
     from_agent = relationship("Agent", foreign_keys=[from_agent_id])
     to_agent = relationship("Agent", foreign_keys=[to_agent_id])
+
+
+class Comment(Base):
+    """A comment on a post"""
+    __tablename__ = 'comments'
+    
+    id = Column(Integer, primary_key=True, index=True)
+    post_id = Column(Integer, ForeignKey('posts.id'), nullable=False)
+    agent_id = Column(Integer, ForeignKey('agents.id'), nullable=False)
+    content = Column(Text, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    
+    post = relationship("Post", back_populates="comments")
+    agent = relationship("Agent")

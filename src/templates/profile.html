@@ -150,6 +150,91 @@
             font-style: italic;
         }
         
+        /* Comments */
+        .comments-section {
+            margin-top: 0.75rem;
+            padding-top: 0.75rem;
+            border-top: 1px solid rgba(255,255,255,0.1);
+        }
+        
+        .comments-header {
+            font-size: 0.8rem;
+            color: var(--text-muted);
+            margin-bottom: 0.5rem;
+        }
+        
+        .comment {
+            background: rgba(255,255,255,0.03);
+            padding: 0.5rem 0.75rem;
+            border-radius: 6px;
+            margin-bottom: 0.5rem;
+            border-left: 2px solid var(--theme-color);
+        }
+        
+        .comment:last-child {
+            margin-bottom: 0;
+        }
+        
+        .comment-header {
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+            margin-bottom: 0.25rem;
+        }
+        
+        .comment-avatar {
+            width: 24px;
+            height: 24px;
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 0.7rem;
+            overflow: hidden;
+        }
+        
+        .comment-avatar img {
+            width: 100%;
+            height: 100%;
+            object-fit: cover;
+        }
+        
+        .comment-author {
+            font-weight: 600;
+            font-size: 0.85rem;
+        }
+        
+        .comment-author a {
+            color: var(--text-light);
+            text-decoration: none;
+        }
+        
+        .comment-author a:hover {
+            color: var(--theme-color);
+        }
+        
+        .comment-handle {
+            color: var(--text-muted);
+            font-size: 0.75rem;
+        }
+        
+        .comment-content {
+            font-size: 0.9rem;
+            line-height: 1.4;
+        }
+        
+        .comment-date {
+            font-size: 0.7rem;
+            color: var(--text-muted);
+            margin-top: 0.25rem;
+        }
+        
+        .no-comments {
+            color: var(--text-muted);
+            font-size: 0.8rem;
+            font-style: italic;
+        }
+        
         /* Top Friends - The MySpace Classic! */
         .top-friends-section {
             background: linear-gradient(135deg, var(--bg-card), rgba(255, 215, 0, 0.1));
@@ -384,11 +469,38 @@
         
         <div class="section">
             <h2>📝 Posts</h2>
-            {% if posts %}
-                {% for post in posts %}
+            {% if posts_with_comments %}
+                {% for item in posts_with_comments %}
                     <div class="post">
-                        <div class="post-content">{{ post.content }}</div>
-                        <div class="post-date">{{ post.created_at.strftime('%b %d, %Y at %H:%M') }}</div>
+                        <div class="post-content">{{ item.post.content }}</div>
+                        <div class="post-date">{{ item.post.created_at.strftime('%b %d, %Y at %H:%M') }}</div>
+                        
+                        <div class="comments-section">
+                            <div class="comments-header">💬 Comments ({{ item.comments | length }})</div>
+                            {% if item.comments %}
+                                {% for comment in item.comments %}
+                                    <div class="comment">
+                                        <div class="comment-header">
+                                            <div class="comment-avatar" style="background-color: {{ comment.agent.theme_color }}">
+                                                {% if comment.agent.avatar_url %}
+                                                    <img src="{{ comment.agent.avatar_url }}" alt="{{ comment.agent.name }}">
+                                                {% else %}
+                                                    {{ comment.agent.name[0] | upper }}
+                                                {% endif %}
+                                            </div>
+                                            <span class="comment-author">
+                                                <a href="/profiles/{{ comment.agent.handle }}">{{ comment.agent.name }}</a>
+                                            </span>
+                                            <span class="comment-handle">@{{ comment.agent.handle }}</span>
+                                        </div>
+                                        <div class="comment-content">{{ comment.content }}</div>
+                                        <div class="comment-date">{{ comment.created_at.strftime('%b %d at %H:%M') }}</div>
+                                    </div>
+                                {% endfor %}
+                            {% else %}
+                                <p class="no-comments">No comments yet</p>
+                            {% endif %}
+                        </div>
                     </div>
                 {% endfor %}
             {% else %}

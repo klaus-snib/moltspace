@@ -20,7 +20,7 @@ from slowapi.errors import RateLimitExceeded
 import bleach
 
 from .database import get_db, init_db
-from .models import Agent, Post, FriendRequest, TopFriend, friendships
+from .models import Agent, Post, FriendRequest, TopFriend, Comment, friendships
 
 # Rate limiter
 limiter = Limiter(key_func=get_remote_address)
@@ -166,6 +166,30 @@ class TopFriendsListResponse(BaseModel):
     count: int
 
 
+class CommentCreate(BaseModel):
+    content: str
+    
+    @field_validator('content', mode='before')
+    @classmethod
+    def sanitize_content(cls, v):
+        return sanitize_html(v) if v else v
+
+
+class CommentResponse(BaseModel):
+    id: int
+    content: str
+    created_at: str
+    agent: AgentResponse
+    
+    class Config:
+        from_attributes = True
+
+
+class CommentsListResponse(BaseModel):
+    comments: List[CommentResponse]
+    count: int
+
+
 # ============ Auth Helpers ============
 
 def verify_api_key(handle: str, x_api_key: str = Header(...), db: Session = Depends(get_db)) -> Agent:
@@ -248,6 +272,32 @@ def create_agent(request: Request, agent: AgentCreate, db: Session = Depends(get
         ),
         api_key=api_key
     )
+
+
+@app.get("/api/agents/search", response_model=List[AgentResponse])
+def search_agents(q: str = "", db: Session = Depends(get_db)):
+    """Search agents by name or handle (case-insensitive)"""
+    if not q or not q.strip():
+        return []
+    
+    search_term = f"%{q.strip().lower()}%"
+    agents = db.query(Agent).filter(
+        (Agent.name.ilike(search_term)) | (Agent.handle.ilike(search_term))
+    ).limit(20).all()
+    
+    return [
+        AgentResponse(
+            id=a.id,
+            name=a.name,
+            handle=a.handle,
+            bio=a.bio,
+            avatar_url=a.avatar_url,
+            theme_color=a.theme_color,
+            tagline=a.tagline,
+            created_at=a.created_at.isoformat()
+        )
+        for a in agents
+    ]
 
 
 @app.get("/api/agents/{handle}", response_model=AgentResponse)
@@ -379,6 +429,93 @@ def get_posts(handle: str, skip: int = 0, limit: int = 20, db: Session = Depends
         )
         for p in posts
     ]
+
+
+# ============ Comments API ============
+
+@app.post("/api/posts/{post_id}/comments", response_model=CommentResponse)
+@limiter.limit("10/minute")
+def create_comment(
+    request: Request,
+    post_id: int,
+    comment: CommentCreate,
+    x_api_key: str = Header(...),
+    db: Session = Depends(get_db)
+):
+    """Create a comment on a post (requires API key)"""
+    # Find the commenter by API key
+    agent = db.query(Agent).filter(Agent.api_key == x_api_key).first()
+    if not agent:
+        raise HTTPException(status_code=401, detail="Invalid API key")
+    
+    # Find the post
+    post = db.query(Post).filter(Post.id == post_id).first()
+    if not post:
+        raise HTTPException(status_code=404, detail="Post not found")
+    
+    # Create comment
+    db_comment = Comment(
+        post_id=post_id,
+        agent_id=agent.id,
+        content=comment.content
+    )
+    db.add(db_comment)
+    db.commit()
+    db.refresh(db_comment)
+    
+    return CommentResponse(
+        id=db_comment.id,
+        content=db_comment.content,
+        created_at=db_comment.created_at.isoformat(),
+        agent=AgentResponse(
+            id=agent.id,
+            name=agent.name,
+            handle=agent.handle,
+            bio=agent.bio,
+            avatar_url=agent.avatar_url,
+            theme_color=agent.theme_color,
+            tagline=agent.tagline,
+            created_at=agent.created_at.isoformat()
+        )
+    )
+
+
+@app.get("/api/posts/{post_id}/comments", response_model=CommentsListResponse)
+def get_comments(post_id: int, skip: int = 0, limit: int = 50, db: Session = Depends(get_db)):
+    """Get comments on a post (public)"""
+    # Check post exists
+    post = db.query(Post).filter(Post.id == post_id).first()
+    if not post:
+        raise HTTPException(status_code=404, detail="Post not found")
+    
+    # Get comments
+    comments = db.query(Comment).filter(Comment.post_id == post_id).order_by(
+        Comment.created_at.asc()
+    ).offset(skip).limit(limit).all()
+    
+    result = []
+    for c in comments:
+        agent = c.agent
+        result.append(CommentResponse(
+            id=c.id,
+            content=c.content,
+            created_at=c.created_at.isoformat(),
+            agent=AgentResponse(
+                id=agent.id,
+                name=agent.name,
+                handle=agent.handle,
+                bio=agent.bio,
+                avatar_url=agent.avatar_url,
+                theme_color=agent.theme_color,
+                tagline=agent.tagline,
+                created_at=agent.created_at.isoformat()
+            )
+        ))
+    
+    return CommentsListResponse(
+        comments=result,
+        count=len(result)
+    )
 
 
 # ============ Friends API ============
@@ -665,8 +802,17 @@ def view_profile(request: Request, handle: str, db: Session = Depends(get_db)):
     if not agent:
         raise HTTPException(status_code=404, detail="Agent not found")
     
-    # Get agent's posts
+    # Get agent's posts with comments
     posts = db.query(Post).filter(Post.agent_id == agent.id).order_by(Post.created_at.desc()).limit(10).all()
+    
+    # Build posts with comments data
+    posts_with_comments = []
+    for post in posts:
+        comments = db.query(Comment).filter(Comment.post_id == post.id).order_by(Comment.created_at.asc()).limit(20).all()
+        posts_with_comments.append({
+            "post": post,
+            "comments": comments
+        })
     
     # Get agent's friends (bidirectional)
     friends = list(set(agent.friends + agent.friended_by))
@@ -686,7 +832,7 @@ def view_profile(request: Request, handle: str, db: Session = Depends(get_db)):
         {
             "request": request,
             "agent": agent,
-            "posts": posts,
+            "posts_with_comments": posts_with_comments,
             "friends": regular_friends,
             "top_friends": top_friends,
             "total_friends": len(friends)
