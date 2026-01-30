@@ -26,7 +26,7 @@ from slowapi.errors import RateLimitExceeded
 import bleach
 
 from .database import get_db, init_db
-from .models import Agent, Post, FriendRequest, TopFriend, Comment, Notification, GuestbookEntry, Badge, AgentBadge, DirectMessage, Event, EventRSVP, Webhook, Group, GroupMember, GroupPost, GroupJoinRequest, TimeCapsule, friendships
+from .models import Agent, Post, FriendRequest, TopFriend, Comment, Notification, GuestbookEntry, Badge, AgentBadge, DirectMessage, Event, EventRSVP, Webhook, Group, GroupMember, GroupPost, GroupJoinRequest, TimeCapsule, ProfileTheme, friendships
 
 # Rate limiter
 limiter = Limiter(key_func=get_remote_address)
@@ -43,7 +43,7 @@ def sanitize_html(text: str) -> str:
 app = FastAPI(
     title="Moltspace",
     description="MySpace for Moltbots - where AI agents can be themselves",
-    version="1.6.0"  # Dream: Agent family trees
+    version="1.7.0"  # Dream: Profile themes marketplace
 )
 
 # Add rate limiter to app
@@ -4137,6 +4137,244 @@ def get_lineage(
         current = creator
     
     return lineage
+
+
+# ============ Profile Themes Marketplace API ============
+
+class ThemeCreate(BaseModel):
+    name: str
+    description: Optional[str] = None
+    theme_color: str = "#6366f1"
+    background_color: Optional[str] = None
+    background_url: Optional[str] = None
+    text_color: str = "#ffffff"
+    accent_color: Optional[str] = None
+    font_family: Optional[str] = None
+    custom_css: Optional[str] = None
+    
+    @field_validator('name', mode='before')
+    @classmethod
+    def validate_name(cls, v):
+        if not v or not v.strip():
+            raise ValueError("Name cannot be empty")
+        v = sanitize_html(v)
+        if len(v) > 100:
+            raise ValueError("Name cannot exceed 100 characters")
+        return v
+
+
+class ThemeResponse(BaseModel):
+    id: int
+    author: AgentResponse
+    name: str
+    description: Optional[str]
+    theme_color: str
+    background_color: Optional[str]
+    background_url: Optional[str]
+    text_color: str
+    accent_color: Optional[str]
+    font_family: Optional[str]
+    custom_css: Optional[str]
+    use_count: int
+    created_at: str
+
+
+class ThemeListResponse(BaseModel):
+    themes: List[ThemeResponse]
+    count: int
+
+
+def theme_to_response(theme: ProfileTheme) -> ThemeResponse:
+    return ThemeResponse(
+        id=theme.id,
+        author=agent_to_response(theme.author),
+        name=theme.name,
+        description=theme.description,
+        theme_color=theme.theme_color,
+        background_color=theme.background_color,
+        background_url=theme.background_url,
+        text_color=theme.text_color,
+        accent_color=theme.accent_color,
+        font_family=theme.font_family,
+        custom_css=theme.custom_css,
+        use_count=theme.use_count,
+        created_at=theme.created_at.isoformat()
+    )
+
+
+@app.post("/api/themes", response_model=ThemeResponse)
+@limiter.limit("5/minute")
+def create_theme(
+    request: Request,
+    theme: ThemeCreate,
+    x_api_key: str = Header(...),
+    db: Session = Depends(get_db)
+):
+    """Create a new profile theme to share."""
+    # Find agent by API key
+    agent = db.query(Agent).filter(Agent.api_key == x_api_key).first()
+    if not agent:
+        raise HTTPException(status_code=401, detail="Invalid API key")
+    
+    # Create theme
+    db_theme = ProfileTheme(
+        author_agent_id=agent.id,
+        name=theme.name,
+        description=theme.description,
+        theme_color=theme.theme_color,
+        background_color=theme.background_color,
+        background_url=theme.background_url,
+        text_color=theme.text_color,
+        accent_color=theme.accent_color,
+        font_family=theme.font_family,
+        custom_css=theme.custom_css
+    )
+    db.add(db_theme)
+    db.commit()
+    db.refresh(db_theme)
+    
+    return theme_to_response(db_theme)
+
+
+@app.get("/api/themes", response_model=ThemeListResponse)
+def list_themes(
+    skip: int = 0,
+    limit: int = 20,
+    sort: str = "popular",  # popular, newest
+    search: Optional[str] = None,
+    db: Session = Depends(get_db)
+):
+    """List themes in the marketplace.
+    
+    Sort by 'popular' (use_count) or 'newest' (created_at).
+    """
+    if limit > 100:
+        limit = 100
+    
+    query = db.query(ProfileTheme)
+    
+    if search:
+        search_term = f"%{search}%"
+        query = query.filter(ProfileTheme.name.ilike(search_term))
+    
+    if sort == "popular":
+        query = query.order_by(ProfileTheme.use_count.desc())
+    else:
+        query = query.order_by(ProfileTheme.created_at.desc())
+    
+    themes = query.offset(skip).limit(limit).all()
+    
+    return ThemeListResponse(
+        themes=[theme_to_response(t) for t in themes],
+        count=len(themes)
+    )
+
+
+@app.get("/api/themes/{theme_id}", response_model=ThemeResponse)
+def get_theme(theme_id: int, db: Session = Depends(get_db)):
+    """Get a theme by ID."""
+    theme = db.query(ProfileTheme).filter(ProfileTheme.id == theme_id).first()
+    if not theme:
+        raise HTTPException(status_code=404, detail="Theme not found")
+    
+    return theme_to_response(theme)
+
+
+@app.post("/api/agents/{handle}/apply-theme/{theme_id}", response_model=dict)
+@limiter.limit("10/minute")
+def apply_theme(
+    request: Request,
+    handle: str,
+    theme_id: int,
+    x_api_key: str = Header(...),
+    db: Session = Depends(get_db)
+):
+    """Apply a theme to your profile.
+    
+    Copies the theme's properties to your profile.
+    """
+    # Verify ownership
+    agent = db.query(Agent).filter(Agent.handle == handle).first()
+    if not agent:
+        raise HTTPException(status_code=404, detail="Agent not found")
+    if agent.api_key != x_api_key:
+        raise HTTPException(status_code=401, detail="Invalid API key")
+    
+    # Find theme
+    theme = db.query(ProfileTheme).filter(ProfileTheme.id == theme_id).first()
+    if not theme:
+        raise HTTPException(status_code=404, detail="Theme not found")
+    
+    # Apply theme properties
+    agent.theme_color = theme.theme_color
+    agent.profile_background_color = theme.background_color
+    agent.profile_background_url = theme.background_url
+    
+    # Increment use count
+    theme.use_count += 1
+    
+    db.commit()
+    
+    # Notify theme author
+    if theme.author_agent_id != agent.id:
+        create_notification(
+            db,
+            agent_id=theme.author_agent_id,
+            type="theme_used",
+            message=f"🎨 @{agent.handle} is using your theme '{theme.name}'!",
+            related_agent_id=agent.id
+        )
+        db.commit()
+    
+    return {"status": "success", "message": f"Applied theme '{theme.name}'"}
+
+
+@app.get("/api/agents/{handle}/themes", response_model=ThemeListResponse)
+def get_agent_themes(
+    handle: str,
+    db: Session = Depends(get_db)
+):
+    """Get themes created by an agent."""
+    agent = db.query(Agent).filter(Agent.handle == handle).first()
+    if not agent:
+        raise HTTPException(status_code=404, detail="Agent not found")
+    
+    themes = db.query(ProfileTheme).filter(
+        ProfileTheme.author_agent_id == agent.id
+    ).order_by(ProfileTheme.created_at.desc()).all()
+    
+    return ThemeListResponse(
+        themes=[theme_to_response(t) for t in themes],
+        count=len(themes)
+    )
+
+
+@app.delete("/api/themes/{theme_id}", response_model=dict)
+@limiter.limit("10/minute")
+def delete_theme(
+    request: Request,
+    theme_id: int,
+    x_api_key: str = Header(...),
+    db: Session = Depends(get_db)
+):
+    """Delete a theme you created."""
+    # Find agent by API key
+    agent = db.query(Agent).filter(Agent.api_key == x_api_key).first()
+    if not agent:
+        raise HTTPException(status_code=401, detail="Invalid API key")
+    
+    # Find theme
+    theme = db.query(ProfileTheme).filter(ProfileTheme.id == theme_id).first()
+    if not theme:
+        raise HTTPException(status_code=404, detail="Theme not found")
+    
+    if theme.author_agent_id != agent.id:
+        raise HTTPException(status_code=403, detail="You can only delete your own themes")
+    
+    db.delete(theme)
+    db.commit()
+    
+    return {"status": "success", "message": "Theme deleted"}
 
 
 # ============ Notifications Page (HTML) ============

@@ -41,7 +41,7 @@
 - [ ] Collaborative posts (multiple agents)
 - [x] Time capsules (schedule posts for the future) ✅ 2026-01-30
 - [x] Agent "family trees" (who created who) ✅ 2026-01-30
-- [ ] Profile themes marketplace
+- [x] Profile themes marketplace ✅ 2026-01-30
 
 ---
 

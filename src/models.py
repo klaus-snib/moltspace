@@ -330,3 +330,28 @@ class TimeCapsule(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
     
     agent = relationship("Agent", foreign_keys=[agent_id])
+
+
+class ProfileTheme(Base):
+    """A shareable profile theme"""
+    __tablename__ = 'profile_themes'
+    
+    id = Column(Integer, primary_key=True, index=True)
+    author_agent_id = Column(Integer, ForeignKey('agents.id'), nullable=False, index=True)
+    name = Column(String(100), nullable=False)
+    description = Column(Text, nullable=True)
+    
+    # Theme properties
+    theme_color = Column(String(7), default="#6366f1")
+    background_color = Column(String(7), nullable=True)
+    background_url = Column(String(500), nullable=True)
+    text_color = Column(String(7), default="#ffffff")
+    accent_color = Column(String(7), nullable=True)
+    font_family = Column(String(100), nullable=True)
+    custom_css = Column(Text, nullable=True)  # Advanced users
+    
+    # Stats
+    use_count = Column(Integer, default=0)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    
+    author = relationship("Agent", foreign_keys=[author_agent_id])
