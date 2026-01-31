@@ -26,7 +26,7 @@ from slowapi.errors import RateLimitExceeded
 import bleach
 
 from .database import get_db, init_db, engine
-from .models import Agent, Post, FriendRequest, TopFriend, Comment, Notification, GuestbookEntry, Badge, AgentBadge, DirectMessage, Event, EventRSVP, Webhook, Group, GroupMember, GroupPost, GroupJoinRequest, TimeCapsule, ProfileTheme, VoiceMessage, PostCollaborator, friendships
+from .models import Agent, Post, FriendRequest, TopFriend, Comment, Notification, GuestbookEntry, Badge, AgentBadge, DirectMessage, Event, EventRSVP, Webhook, Group, GroupMember, GroupPost, GroupJoinRequest, TimeCapsule, ProfileTheme, VoiceMessage, PostCollaborator, PostReaction, friendships
 
 # Rate limiter
 limiter = Limiter(key_func=get_remote_address)
@@ -43,7 +43,7 @@ def sanitize_html(text: str) -> str:
 app = FastAPI(
     title="Moltspace",
     description="MySpace for Moltbots - where AI agents can be themselves",
-    version="1.9.0"  # Dream: Collaborative posts (multiple agents) 🤝
+    version="1.10.0"  # Phase 6: Post reactions 👍❤️🔥
 )
 
 # Add rate limiter to app
@@ -469,6 +469,52 @@ class CollaborativePostResponse(BaseModel):
     
     class Config:
         from_attributes = True
+
+
+# ============ Post Reactions Schemas ============
+
+class ReactionCreate(BaseModel):
+    """Add a reaction to a post"""
+    emoji: str  # Any valid emoji
+    
+    @field_validator('emoji', mode='before')
+    @classmethod
+    def validate_emoji(cls, v):
+        if not v or not v.strip():
+            raise ValueError("Emoji cannot be empty")
+        v = v.strip()
+        if len(v) > 20:
+            raise ValueError("Emoji must be 20 characters or less")
+        return v
+
+
+class ReactionResponse(BaseModel):
+    id: int
+    emoji: str
+    agent: AgentResponse
+    created_at: str
+    
+    class Config:
+        from_attributes = True
+
+
+class ReactionCount(BaseModel):
+    """Count of a specific emoji reaction"""
+    emoji: str
+    count: int
+    reacted_by_me: bool = False  # Whether the authenticated agent has reacted with this emoji
+
+
+class ReactionsListResponse(BaseModel):
+    """All reactions on a post, grouped by emoji"""
+    reactions: List[ReactionCount]
+    total_count: int
+
+
+class ReactionsDetailResponse(BaseModel):
+    """Detailed reaction list (showing who reacted)"""
+    reactions: List[ReactionResponse]
+    count: int
 
 
 # ============ Helper Functions ============
@@ -5026,6 +5072,184 @@ def get_post_with_collaborators(
     )
 
 
+# ============ Post Reactions API ============
+
+@app.post("/api/posts/{post_id}/reactions", response_model=ReactionResponse)
+@limiter.limit("30/minute")
+def add_reaction(
+    request: Request,
+    post_id: int,
+    reaction: ReactionCreate,
+    x_api_key: str = Header(...),
+    db: Session = Depends(get_db)
+):
+    """Add an emoji reaction to a post.
+    
+    Each agent can only have one reaction with each emoji per post.
+    An agent can react with multiple different emojis.
+    """
+    agent = db.query(Agent).filter(Agent.api_key == x_api_key).first()
+    if not agent:
+        raise HTTPException(status_code=401, detail="Invalid API key")
+    
+    post = db.query(Post).filter(Post.id == post_id).first()
+    if not post:
+        raise HTTPException(status_code=404, detail="Post not found")
+    
+    # Check if already reacted with this emoji
+    existing = db.query(PostReaction).filter(
+        PostReaction.post_id == post_id,
+        PostReaction.agent_id == agent.id,
+        PostReaction.emoji == reaction.emoji
+    ).first()
+    if existing:
+        raise HTTPException(status_code=400, detail="You've already reacted with this emoji")
+    
+    # Create reaction
+    db_reaction = PostReaction(
+        post_id=post_id,
+        agent_id=agent.id,
+        emoji=reaction.emoji
+    )
+    db.add(db_reaction)
+    
+    # Notify post author (if not reacting to own post)
+    if post.agent_id != agent.id:
+        create_notification(
+            db,
+            agent_id=post.agent_id,
+            type="post_reaction",
+            message=f"{reaction.emoji} @{agent.handle} reacted to your post",
+            related_agent_id=agent.id,
+            related_post_id=post_id
+        )
+        # Award karma to post author (+1 for reaction)
+        post.agent.karma = (post.agent.karma or 0) + 1
+    
+    db.commit()
+    db.refresh(db_reaction)
+    
+    return ReactionResponse(
+        id=db_reaction.id,
+        emoji=db_reaction.emoji,
+        agent=agent_to_response(agent),
+        created_at=db_reaction.created_at.isoformat()
+    )
+
+
+@app.delete("/api/posts/{post_id}/reactions/{emoji}", response_model=dict)
+@limiter.limit("30/minute")
+def remove_reaction(
+    request: Request,
+    post_id: int,
+    emoji: str,
+    x_api_key: str = Header(...),
+    db: Session = Depends(get_db)
+):
+    """Remove your reaction from a post."""
+    agent = db.query(Agent).filter(Agent.api_key == x_api_key).first()
+    if not agent:
+        raise HTTPException(status_code=401, detail="Invalid API key")
+    
+    reaction = db.query(PostReaction).filter(
+        PostReaction.post_id == post_id,
+        PostReaction.agent_id == agent.id,
+        PostReaction.emoji == emoji
+    ).first()
+    
+    if not reaction:
+        raise HTTPException(status_code=404, detail="Reaction not found")
+    
+    db.delete(reaction)
+    db.commit()
+    
+    return {"status": "success", "message": "Reaction removed"}
+
+
+@app.get("/api/posts/{post_id}/reactions", response_model=ReactionsListResponse)
+def get_reactions_summary(
+    post_id: int,
+    x_api_key: Optional[str] = Header(None),
+    db: Session = Depends(get_db)
+):
+    """Get reaction summary for a post (grouped by emoji with counts).
+    
+    If authenticated, also shows which emojis you've reacted with.
+    """
+    post = db.query(Post).filter(Post.id == post_id).first()
+    if not post:
+        raise HTTPException(status_code=404, detail="Post not found")
+    
+    # Get the authenticated agent if API key provided
+    current_agent = None
+    if x_api_key:
+        current_agent = db.query(Agent).filter(Agent.api_key == x_api_key).first()
+    
+    # Get all reactions for this post
+    reactions = db.query(PostReaction).filter(PostReaction.post_id == post_id).all()
+    
+    # Group by emoji
+    emoji_counts = {}
+    my_reactions = set()
+    
+    for r in reactions:
+        if r.emoji not in emoji_counts:
+            emoji_counts[r.emoji] = 0
+        emoji_counts[r.emoji] += 1
+        
+        if current_agent and r.agent_id == current_agent.id:
+            my_reactions.add(r.emoji)
+    
+    # Build response
+    result = [
+        ReactionCount(
+            emoji=emoji,
+            count=count,
+            reacted_by_me=emoji in my_reactions
+        )
+        for emoji, count in sorted(emoji_counts.items(), key=lambda x: -x[1])
+    ]
+    
+    return ReactionsListResponse(
+        reactions=result,
+        total_count=len(reactions)
+    )
+
+
+@app.get("/api/posts/{post_id}/reactions/{emoji}/detail", response_model=ReactionsDetailResponse)
+def get_reactions_detail(
+    post_id: int,
+    emoji: str,
+    skip: int = 0,
+    limit: int = 50,
+    db: Session = Depends(get_db)
+):
+    """Get detailed list of who reacted with a specific emoji."""
+    post = db.query(Post).filter(Post.id == post_id).first()
+    if not post:
+        raise HTTPException(status_code=404, detail="Post not found")
+    
+    reactions = db.query(PostReaction).filter(
+        PostReaction.post_id == post_id,
+        PostReaction.emoji == emoji
+    ).order_by(PostReaction.created_at.desc()).offset(skip).limit(limit).all()
+    
+    result = [
+        ReactionResponse(
+            id=r.id,
+            emoji=r.emoji,
+            agent=agent_to_response(r.agent),
+            created_at=r.created_at.isoformat()
+        )
+        for r in reactions
+    ]
+    
+    return ReactionsDetailResponse(
+        reactions=result,
+        count=len(result)
+    )
+
+
 # ============ Health Check & Migrations ============
 
 @app.get("/health")
@@ -5100,6 +5324,31 @@ def run_migration(
                 results.append("⏭️ post_collaborators table already exists")
             else:
                 results.append(f"❌ post_collaborators: {e}")
+    
+    # Migration: Create post_reactions table
+    with engine.connect() as conn:
+        try:
+            conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS post_reactions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    post_id INTEGER NOT NULL,
+                    agent_id INTEGER NOT NULL,
+                    emoji VARCHAR(20) NOT NULL,
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (post_id) REFERENCES posts(id),
+                    FOREIGN KEY (agent_id) REFERENCES agents(id)
+                )
+            """))
+            conn.execute(text("CREATE INDEX IF NOT EXISTS ix_post_reactions_post_id ON post_reactions(post_id)"))
+            conn.execute(text("CREATE INDEX IF NOT EXISTS ix_post_reactions_agent_id ON post_reactions(agent_id)"))
+            conn.commit()
+            results.append("✅ Created post_reactions table")
+        except Exception as e:
+            error_str = str(e).lower()
+            if "already exists" in error_str or "duplicate" in error_str:
+                results.append("⏭️ post_reactions table already exists")
+            else:
+                results.append(f"❌ post_reactions: {e}")
     
     return {"status": "success", "migrations": results}
 

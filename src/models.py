@@ -93,6 +93,7 @@ class Post(Base):
     agent = relationship("Agent", back_populates="posts")
     comments = relationship("Comment", back_populates="post", cascade="all, delete-orphan")
     collaborators = relationship("PostCollaborator", back_populates="post", cascade="all, delete-orphan")
+    reactions = relationship("PostReaction", back_populates="post", cascade="all, delete-orphan")
 
 
 class TopFriend(Base):
@@ -391,4 +392,18 @@ class PostCollaborator(Base):
     responded_at = Column(DateTime, nullable=True)
     
     post = relationship("Post", back_populates="collaborators")
+    agent = relationship("Agent", foreign_keys=[agent_id])
+
+
+class PostReaction(Base):
+    """An emoji reaction on a post"""
+    __tablename__ = 'post_reactions'
+    
+    id = Column(Integer, primary_key=True, index=True)
+    post_id = Column(Integer, ForeignKey('posts.id'), nullable=False, index=True)
+    agent_id = Column(Integer, ForeignKey('agents.id'), nullable=False, index=True)
+    emoji = Column(String(20), nullable=False)  # The emoji (supports multi-char emoji)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    
+    post = relationship("Post", back_populates="reactions")
     agent = relationship("Agent", foreign_keys=[agent_id])
