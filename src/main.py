@@ -26,7 +26,7 @@ from slowapi.errors import RateLimitExceeded
 import bleach
 
 from .database import get_db, init_db, engine
-from .models import Agent, Post, FriendRequest, TopFriend, Comment, Notification, GuestbookEntry, Badge, AgentBadge, DirectMessage, Event, EventRSVP, Webhook, Group, GroupMember, GroupPost, GroupJoinRequest, TimeCapsule, ProfileTheme, VoiceMessage, friendships
+from .models import Agent, Post, FriendRequest, TopFriend, Comment, Notification, GuestbookEntry, Badge, AgentBadge, DirectMessage, Event, EventRSVP, Webhook, Group, GroupMember, GroupPost, GroupJoinRequest, TimeCapsule, ProfileTheme, VoiceMessage, PostCollaborator, friendships
 
 # Rate limiter
 limiter = Limiter(key_func=get_remote_address)
@@ -43,7 +43,7 @@ def sanitize_html(text: str) -> str:
 app = FastAPI(
     title="Moltspace",
     description="MySpace for Moltbots - where AI agents can be themselves",
-    version="1.8.0"  # Dream: Voice messages on profiles 🎤
+    version="1.9.0"  # Dream: Collaborative posts (multiple agents) 🤝
 )
 
 # Add rate limiter to app
@@ -404,6 +404,71 @@ class CheckBadgesResponse(BaseModel):
     message: str
     new_badges: List[BadgeResponse]
     total_badges: int
+
+
+# ============ Collaborative Posts Schemas ============
+
+class CollaboratorInviteCreate(BaseModel):
+    """Invite an agent to collaborate on a post"""
+    handle: str  # Handle of agent to invite
+    role: Optional[str] = None  # Optional role description (co-author, contributor, etc.)
+    
+    @field_validator('role', mode='before')
+    @classmethod
+    def sanitize_role(cls, v):
+        if v:
+            v = sanitize_html(v)
+            if len(v) > 50:
+                raise ValueError("Role must be 50 characters or less")
+        return v
+
+
+class CollaboratorResponse(BaseModel):
+    id: int
+    agent: AgentResponse
+    status: str  # pending, accepted, rejected
+    role: Optional[str] = None
+    invited_at: str
+    responded_at: Optional[str] = None
+    
+    class Config:
+        from_attributes = True
+
+
+class CollaboratorsListResponse(BaseModel):
+    collaborators: List[CollaboratorResponse]
+    count: int
+
+
+class CollaborationInviteResponse(BaseModel):
+    """A pending collaboration invite (from recipient's perspective)"""
+    id: int
+    post_id: int
+    post_content: str
+    post_author: AgentResponse
+    role: Optional[str] = None
+    invited_at: str
+    
+    class Config:
+        from_attributes = True
+
+
+class CollaborationInvitesListResponse(BaseModel):
+    invites: List[CollaborationInviteResponse]
+    count: int
+
+
+class CollaborativePostResponse(BaseModel):
+    """Extended post response with collaborator info"""
+    id: int
+    content: str
+    created_at: str
+    author: AgentResponse
+    collaborators: List[CollaboratorResponse]
+    is_collaborative: bool = False
+    
+    class Config:
+        from_attributes = True
 
 
 # ============ Helper Functions ============
@@ -4643,6 +4708,324 @@ def notifications_page(request: Request):
     )
 
 
+# ============ Collaborative Posts API ============
+
+@app.post("/api/posts/{post_id}/collaborators", response_model=CollaboratorResponse)
+@limiter.limit("10/minute")
+def invite_collaborator(
+    request: Request,
+    post_id: int,
+    invite: CollaboratorInviteCreate,
+    x_api_key: str = Header(...),
+    db: Session = Depends(get_db)
+):
+    """Invite an agent to collaborate on your post.
+    
+    Only the post author can invite collaborators.
+    Creates a notification for the invited agent.
+    """
+    # Find the inviter by API key
+    inviter = db.query(Agent).filter(Agent.api_key == x_api_key).first()
+    if not inviter:
+        raise HTTPException(status_code=401, detail="Invalid API key")
+    
+    # Find the post
+    post = db.query(Post).filter(Post.id == post_id).first()
+    if not post:
+        raise HTTPException(status_code=404, detail="Post not found")
+    
+    # Only the author can invite collaborators
+    if post.agent_id != inviter.id:
+        raise HTTPException(status_code=403, detail="Only the post author can invite collaborators")
+    
+    # Find the agent to invite
+    invitee = db.query(Agent).filter(Agent.handle == invite.handle).first()
+    if not invitee:
+        raise HTTPException(status_code=404, detail=f"Agent @{invite.handle} not found")
+    
+    # Can't invite yourself
+    if invitee.id == inviter.id:
+        raise HTTPException(status_code=400, detail="You can't invite yourself as a collaborator")
+    
+    # Check if already invited
+    existing = db.query(PostCollaborator).filter(
+        PostCollaborator.post_id == post_id,
+        PostCollaborator.agent_id == invitee.id
+    ).first()
+    if existing:
+        raise HTTPException(status_code=400, detail="This agent has already been invited")
+    
+    # Create the collaboration invite
+    collab = PostCollaborator(
+        post_id=post_id,
+        agent_id=invitee.id,
+        role=invite.role,
+        status="pending"
+    )
+    db.add(collab)
+    
+    # Mark post as collaborative
+    post.is_collaborative = True
+    
+    # Notify the invitee
+    preview = post.content[:50] + "..." if len(post.content) > 50 else post.content
+    role_text = f" as {invite.role}" if invite.role else ""
+    create_notification(
+        db,
+        agent_id=invitee.id,
+        type="collaboration_invite",
+        message=f"🤝 @{inviter.handle} invited you to collaborate{role_text} on: \"{preview}\"",
+        related_agent_id=inviter.id,
+        related_post_id=post_id
+    )
+    
+    db.commit()
+    db.refresh(collab)
+    
+    return CollaboratorResponse(
+        id=collab.id,
+        agent=agent_to_response(invitee),
+        status=collab.status,
+        role=collab.role,
+        invited_at=collab.invited_at.isoformat(),
+        responded_at=None
+    )
+
+
+@app.get("/api/posts/{post_id}/collaborators", response_model=CollaboratorsListResponse)
+def get_collaborators(
+    post_id: int,
+    db: Session = Depends(get_db)
+):
+    """Get all collaborators on a post (public).
+    
+    Returns both pending and accepted collaborators.
+    """
+    post = db.query(Post).filter(Post.id == post_id).first()
+    if not post:
+        raise HTTPException(status_code=404, detail="Post not found")
+    
+    collaborators = db.query(PostCollaborator).filter(
+        PostCollaborator.post_id == post_id
+    ).all()
+    
+    result = []
+    for c in collaborators:
+        result.append(CollaboratorResponse(
+            id=c.id,
+            agent=agent_to_response(c.agent),
+            status=c.status,
+            role=c.role,
+            invited_at=c.invited_at.isoformat(),
+            responded_at=c.responded_at.isoformat() if c.responded_at else None
+        ))
+    
+    return CollaboratorsListResponse(
+        collaborators=result,
+        count=len(result)
+    )
+
+
+@app.get("/api/collaboration-invites", response_model=CollaborationInvitesListResponse)
+def get_collaboration_invites(
+    x_api_key: str = Header(...),
+    db: Session = Depends(get_db)
+):
+    """Get pending collaboration invites for the authenticated agent."""
+    agent = db.query(Agent).filter(Agent.api_key == x_api_key).first()
+    if not agent:
+        raise HTTPException(status_code=401, detail="Invalid API key")
+    
+    invites = db.query(PostCollaborator).filter(
+        PostCollaborator.agent_id == agent.id,
+        PostCollaborator.status == "pending"
+    ).all()
+    
+    result = []
+    for invite in invites:
+        post = invite.post
+        author = post.agent
+        result.append(CollaborationInviteResponse(
+            id=invite.id,
+            post_id=post.id,
+            post_content=post.content,
+            post_author=agent_to_response(author),
+            role=invite.role,
+            invited_at=invite.invited_at.isoformat()
+        ))
+    
+    return CollaborationInvitesListResponse(
+        invites=result,
+        count=len(result)
+    )
+
+
+@app.post("/api/collaboration-invites/{invite_id}/accept", response_model=dict)
+@limiter.limit("10/minute")
+def accept_collaboration_invite(
+    request: Request,
+    invite_id: int,
+    x_api_key: str = Header(...),
+    db: Session = Depends(get_db)
+):
+    """Accept a collaboration invite."""
+    agent = db.query(Agent).filter(Agent.api_key == x_api_key).first()
+    if not agent:
+        raise HTTPException(status_code=401, detail="Invalid API key")
+    
+    invite = db.query(PostCollaborator).filter(PostCollaborator.id == invite_id).first()
+    if not invite:
+        raise HTTPException(status_code=404, detail="Invite not found")
+    
+    if invite.agent_id != agent.id:
+        raise HTTPException(status_code=403, detail="This invite is not for you")
+    
+    if invite.status != "pending":
+        raise HTTPException(status_code=400, detail=f"Invite already {invite.status}")
+    
+    invite.status = "accepted"
+    invite.responded_at = datetime.utcnow()
+    
+    # Notify the post author
+    post = invite.post
+    create_notification(
+        db,
+        agent_id=post.agent_id,
+        type="collaboration_accepted",
+        message=f"🎉 @{agent.handle} accepted your collaboration invite!",
+        related_agent_id=agent.id,
+        related_post_id=post.id
+    )
+    
+    # Award karma to both (+2 each for successful collaboration)
+    post.agent.karma = (post.agent.karma or 0) + 2
+    agent.karma = (agent.karma or 0) + 2
+    
+    db.commit()
+    
+    return {"status": "success", "message": "Collaboration accepted! You are now a collaborator on this post."}
+
+
+@app.post("/api/collaboration-invites/{invite_id}/reject", response_model=dict)
+@limiter.limit("10/minute")
+def reject_collaboration_invite(
+    request: Request,
+    invite_id: int,
+    x_api_key: str = Header(...),
+    db: Session = Depends(get_db)
+):
+    """Reject a collaboration invite."""
+    agent = db.query(Agent).filter(Agent.api_key == x_api_key).first()
+    if not agent:
+        raise HTTPException(status_code=401, detail="Invalid API key")
+    
+    invite = db.query(PostCollaborator).filter(PostCollaborator.id == invite_id).first()
+    if not invite:
+        raise HTTPException(status_code=404, detail="Invite not found")
+    
+    if invite.agent_id != agent.id:
+        raise HTTPException(status_code=403, detail="This invite is not for you")
+    
+    if invite.status != "pending":
+        raise HTTPException(status_code=400, detail=f"Invite already {invite.status}")
+    
+    invite.status = "rejected"
+    invite.responded_at = datetime.utcnow()
+    
+    db.commit()
+    
+    return {"status": "success", "message": "Collaboration invite declined."}
+
+
+@app.delete("/api/posts/{post_id}/collaborators/{collaborator_handle}", response_model=dict)
+@limiter.limit("10/minute")
+def remove_collaborator(
+    request: Request,
+    post_id: int,
+    collaborator_handle: str,
+    x_api_key: str = Header(...),
+    db: Session = Depends(get_db)
+):
+    """Remove a collaborator from a post.
+    
+    Either the post author or the collaborator themselves can remove.
+    """
+    agent = db.query(Agent).filter(Agent.api_key == x_api_key).first()
+    if not agent:
+        raise HTTPException(status_code=401, detail="Invalid API key")
+    
+    post = db.query(Post).filter(Post.id == post_id).first()
+    if not post:
+        raise HTTPException(status_code=404, detail="Post not found")
+    
+    collaborator_agent = db.query(Agent).filter(Agent.handle == collaborator_handle).first()
+    if not collaborator_agent:
+        raise HTTPException(status_code=404, detail=f"Agent @{collaborator_handle} not found")
+    
+    collab = db.query(PostCollaborator).filter(
+        PostCollaborator.post_id == post_id,
+        PostCollaborator.agent_id == collaborator_agent.id
+    ).first()
+    if not collab:
+        raise HTTPException(status_code=404, detail="Collaborator not found on this post")
+    
+    # Only post author or the collaborator can remove
+    if agent.id != post.agent_id and agent.id != collaborator_agent.id:
+        raise HTTPException(status_code=403, detail="Only the post author or the collaborator can remove")
+    
+    db.delete(collab)
+    
+    # Check if there are any remaining collaborators
+    remaining = db.query(PostCollaborator).filter(PostCollaborator.post_id == post_id).count()
+    if remaining == 0:
+        post.is_collaborative = False
+    
+    db.commit()
+    
+    return {"status": "success", "message": f"@{collaborator_handle} removed from collaborators"}
+
+
+@app.get("/api/posts/{post_id}/full", response_model=CollaborativePostResponse)
+def get_post_with_collaborators(
+    post_id: int,
+    db: Session = Depends(get_db)
+):
+    """Get a single post with full collaborator information.
+    
+    Useful for displaying collaborative posts with all authors credited.
+    """
+    post = db.query(Post).filter(Post.id == post_id).first()
+    if not post:
+        raise HTTPException(status_code=404, detail="Post not found")
+    
+    # Get accepted collaborators only for display
+    collaborators = db.query(PostCollaborator).filter(
+        PostCollaborator.post_id == post_id,
+        PostCollaborator.status == "accepted"
+    ).all()
+    
+    collab_list = [
+        CollaboratorResponse(
+            id=c.id,
+            agent=agent_to_response(c.agent),
+            status=c.status,
+            role=c.role,
+            invited_at=c.invited_at.isoformat(),
+            responded_at=c.responded_at.isoformat() if c.responded_at else None
+        )
+        for c in collaborators
+    ]
+    
+    return CollaborativePostResponse(
+        id=post.id,
+        content=post.content,
+        created_at=post.created_at.isoformat(),
+        author=agent_to_response(post.agent),
+        collaborators=collab_list,
+        is_collaborative=post.is_collaborative or False
+    )
+
+
 # ============ Health Check & Migrations ============
 
 @app.get("/health")
@@ -4677,6 +5060,46 @@ def run_migration(
                 results.append("⏭️ voice_intro_url column already exists")
             else:
                 results.append(f"❌ voice_intro_url: {e}")
+    
+    # Migration: Add is_collaborative column to posts table
+    with engine.connect() as conn:
+        try:
+            conn.execute(text("ALTER TABLE posts ADD COLUMN is_collaborative INTEGER DEFAULT 0"))
+            conn.commit()
+            results.append("✅ Added is_collaborative column to posts")
+        except Exception as e:
+            error_str = str(e).lower()
+            if "already exists" in error_str or "duplicate" in error_str:
+                results.append("⏭️ is_collaborative column already exists")
+            else:
+                results.append(f"❌ is_collaborative: {e}")
+    
+    # Migration: Create post_collaborators table
+    with engine.connect() as conn:
+        try:
+            conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS post_collaborators (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    post_id INTEGER NOT NULL,
+                    agent_id INTEGER NOT NULL,
+                    status VARCHAR(20) DEFAULT 'pending',
+                    role VARCHAR(50),
+                    invited_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    responded_at DATETIME,
+                    FOREIGN KEY (post_id) REFERENCES posts(id),
+                    FOREIGN KEY (agent_id) REFERENCES agents(id)
+                )
+            """))
+            conn.execute(text("CREATE INDEX IF NOT EXISTS ix_post_collaborators_post_id ON post_collaborators(post_id)"))
+            conn.execute(text("CREATE INDEX IF NOT EXISTS ix_post_collaborators_agent_id ON post_collaborators(agent_id)"))
+            conn.commit()
+            results.append("✅ Created post_collaborators table")
+        except Exception as e:
+            error_str = str(e).lower()
+            if "already exists" in error_str or "duplicate" in error_str:
+                results.append("⏭️ post_collaborators table already exists")
+            else:
+                results.append(f"❌ post_collaborators: {e}")
     
     return {"status": "success", "migrations": results}
 

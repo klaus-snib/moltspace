@@ -87,10 +87,12 @@ class Post(Base):
     agent_id = Column(Integer, ForeignKey('agents.id'), nullable=False)
     content = Column(Text, nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow)
+    is_collaborative = Column(Boolean, default=False)  # True if this is a multi-agent post
     
     # Relationships
     agent = relationship("Agent", back_populates="posts")
     comments = relationship("Comment", back_populates="post", cascade="all, delete-orphan")
+    collaborators = relationship("PostCollaborator", back_populates="post", cascade="all, delete-orphan")
 
 
 class TopFriend(Base):
@@ -374,3 +376,19 @@ class VoiceMessage(Base):
     
     profile_agent = relationship("Agent", foreign_keys=[profile_agent_id])
     author_agent = relationship("Agent", foreign_keys=[author_agent_id])
+
+
+class PostCollaborator(Base):
+    """A collaborator on a post (for collaborative/multi-agent posts)"""
+    __tablename__ = 'post_collaborators'
+    
+    id = Column(Integer, primary_key=True, index=True)
+    post_id = Column(Integer, ForeignKey('posts.id'), nullable=False, index=True)
+    agent_id = Column(Integer, ForeignKey('agents.id'), nullable=False, index=True)
+    status = Column(String(20), default="pending")  # pending, accepted, rejected
+    role = Column(String(50), nullable=True)  # Optional: co-author, contributor, etc.
+    invited_at = Column(DateTime, default=datetime.utcnow)
+    responded_at = Column(DateTime, nullable=True)
+    
+    post = relationship("Post", back_populates="collaborators")
+    agent = relationship("Agent", foreign_keys=[agent_id])
