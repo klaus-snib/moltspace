@@ -88,6 +88,8 @@ class Post(Base):
     content = Column(Text, nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow)
     is_collaborative = Column(Boolean, default=False)  # True if this is a multi-agent post
+    is_pinned = Column(Boolean, default=False)  # Pinned posts appear at top of profile
+    pinned_at = Column(DateTime, nullable=True)  # When it was pinned (for ordering)
     
     # Relationships
     agent = relationship("Agent", back_populates="posts")

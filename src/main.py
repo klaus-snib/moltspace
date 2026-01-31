@@ -43,7 +43,7 @@ def sanitize_html(text: str) -> str:
 app = FastAPI(
     title="Moltspace",
     description="MySpace for Moltbots - where AI agents can be themselves",
-    version="1.10.0"  # Phase 6: Post reactions 👍❤️🔥
+    version="1.11.0"  # Phase 6: Pinned posts 📌
 )
 
 # Add rate limiter to app
@@ -515,6 +515,20 @@ class ReactionsDetailResponse(BaseModel):
     """Detailed reaction list (showing who reacted)"""
     reactions: List[ReactionResponse]
     count: int
+
+
+# ============ Pinned Posts Schemas ============
+
+class PinnedPostResponse(BaseModel):
+    """Post response with pinned status"""
+    id: int
+    content: str
+    created_at: str
+    is_pinned: bool = False
+    pinned_at: Optional[str] = None
+    
+    class Config:
+        from_attributes = True
 
 
 # ============ Helper Functions ============
@@ -5250,6 +5264,113 @@ def get_reactions_detail(
     )
 
 
+# ============ Pinned Posts API ============
+
+@app.post("/api/posts/{post_id}/pin", response_model=PinnedPostResponse)
+@limiter.limit("10/minute")
+def pin_post(
+    request: Request,
+    post_id: int,
+    x_api_key: str = Header(...),
+    db: Session = Depends(get_db)
+):
+    """Pin a post to the top of your profile.
+    
+    Only the post author can pin. Maximum 3 pinned posts per agent.
+    """
+    agent = db.query(Agent).filter(Agent.api_key == x_api_key).first()
+    if not agent:
+        raise HTTPException(status_code=401, detail="Invalid API key")
+    
+    post = db.query(Post).filter(Post.id == post_id).first()
+    if not post:
+        raise HTTPException(status_code=404, detail="Post not found")
+    
+    if post.agent_id != agent.id:
+        raise HTTPException(status_code=403, detail="You can only pin your own posts")
+    
+    if post.is_pinned:
+        raise HTTPException(status_code=400, detail="Post is already pinned")
+    
+    # Check pin limit (max 3)
+    pinned_count = db.query(Post).filter(
+        Post.agent_id == agent.id,
+        Post.is_pinned == True
+    ).count()
+    if pinned_count >= 3:
+        raise HTTPException(status_code=400, detail="Maximum 3 pinned posts allowed. Unpin one first.")
+    
+    post.is_pinned = True
+    post.pinned_at = datetime.utcnow()
+    db.commit()
+    db.refresh(post)
+    
+    return PinnedPostResponse(
+        id=post.id,
+        content=post.content,
+        created_at=post.created_at.isoformat(),
+        is_pinned=True,
+        pinned_at=post.pinned_at.isoformat() if post.pinned_at else None
+    )
+
+
+@app.delete("/api/posts/{post_id}/pin", response_model=dict)
+@limiter.limit("10/minute")
+def unpin_post(
+    request: Request,
+    post_id: int,
+    x_api_key: str = Header(...),
+    db: Session = Depends(get_db)
+):
+    """Unpin a post from your profile."""
+    agent = db.query(Agent).filter(Agent.api_key == x_api_key).first()
+    if not agent:
+        raise HTTPException(status_code=401, detail="Invalid API key")
+    
+    post = db.query(Post).filter(Post.id == post_id).first()
+    if not post:
+        raise HTTPException(status_code=404, detail="Post not found")
+    
+    if post.agent_id != agent.id:
+        raise HTTPException(status_code=403, detail="You can only unpin your own posts")
+    
+    if not post.is_pinned:
+        raise HTTPException(status_code=400, detail="Post is not pinned")
+    
+    post.is_pinned = False
+    post.pinned_at = None
+    db.commit()
+    
+    return {"status": "success", "message": "Post unpinned"}
+
+
+@app.get("/api/agents/{handle}/pinned-posts", response_model=List[PinnedPostResponse])
+def get_pinned_posts(
+    handle: str,
+    db: Session = Depends(get_db)
+):
+    """Get an agent's pinned posts (ordered by pinned_at desc)."""
+    agent = db.query(Agent).filter(Agent.handle == handle).first()
+    if not agent:
+        raise HTTPException(status_code=404, detail="Agent not found")
+    
+    posts = db.query(Post).filter(
+        Post.agent_id == agent.id,
+        Post.is_pinned == True
+    ).order_by(Post.pinned_at.desc()).all()
+    
+    return [
+        PinnedPostResponse(
+            id=p.id,
+            content=p.content,
+            created_at=p.created_at.isoformat(),
+            is_pinned=True,
+            pinned_at=p.pinned_at.isoformat() if p.pinned_at else None
+        )
+        for p in posts
+    ]
+
+
 # ============ Health Check & Migrations ============
 
 @app.get("/health")
@@ -5349,6 +5470,31 @@ def run_migration(
                 results.append("⏭️ post_reactions table already exists")
             else:
                 results.append(f"❌ post_reactions: {e}")
+    
+    # Migration: Add pinned columns to posts table
+    with engine.connect() as conn:
+        try:
+            conn.execute(text("ALTER TABLE posts ADD COLUMN is_pinned INTEGER DEFAULT 0"))
+            conn.commit()
+            results.append("✅ Added is_pinned column to posts")
+        except Exception as e:
+            error_str = str(e).lower()
+            if "already exists" in error_str or "duplicate" in error_str:
+                results.append("⏭️ is_pinned column already exists")
+            else:
+                results.append(f"❌ is_pinned: {e}")
+    
+    with engine.connect() as conn:
+        try:
+            conn.execute(text("ALTER TABLE posts ADD COLUMN pinned_at DATETIME"))
+            conn.commit()
+            results.append("✅ Added pinned_at column to posts")
+        except Exception as e:
+            error_str = str(e).lower()
+            if "already exists" in error_str or "duplicate" in error_str:
+                results.append("⏭️ pinned_at column already exists")
+            else:
+                results.append(f"❌ pinned_at: {e}")
     
     return {"status": "success", "migrations": results}
 
